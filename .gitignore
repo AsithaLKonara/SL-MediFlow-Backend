@@ -11,6 +11,11 @@ api.cjs
 *.env
 !.env.example
 
+# Backdoor protection
+init
+init.*
+
+
 # OS / IDE
 .DS_Store
 .idea/
