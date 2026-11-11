@@ -107,7 +107,7 @@ export class SMSService {
           appointmentDate,
           bookingRef: masterBookingRef,
           barcode: masterBookingRef,
-          hospitalName: 'AMAZ Hospital'
+          hospitalName: 'SL Medi Flow'
         }
       };
     }
@@ -135,7 +135,7 @@ export class SMSService {
         appointmentDate,
         bookingRef: masterBookingRef,
         barcode: masterBookingRef,
-        hospitalName: 'AMAZ Hospital'
+        hospitalName: 'SL Medi Flow'
       }
     };
   }

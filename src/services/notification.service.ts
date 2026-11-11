@@ -52,32 +52,32 @@ export class NotificationService {
         if (templateName === 'APPOINTMENT_BOOKED') {
           template = {
             id: 'temp', name: 'APPOINTMENT_BOOKED', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Token #{{tokenNumber}} confirmed for {{patientName}} with Dr. {{doctorName}} on {{appointmentDate}}. Barcode: {{bookingRef}}'
+            content: 'SL Medi Flow: Token #{{tokenNumber}} confirmed for {{patientName}} with Dr. {{doctorName}} on {{appointmentDate}}. Barcode: {{bookingRef}}'
           };
         } else if (templateName === 'VISIT_TOKENS_BOOKED') {
           template = {
             id: 'temp', name: 'VISIT_TOKENS_BOOKED', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Tokens confirmed for {{patientName}} on {{appointmentDate}}: {{tokenDetails}}. Barcode: {{bookingRef}}'
+            content: 'SL Medi Flow: Tokens confirmed for {{patientName}} on {{appointmentDate}}: {{tokenDetails}}. Barcode: {{bookingRef}}'
           };
         } else if (templateName === 'DOCTOR_ARRIVED') {
           template = {
             id: 'temp', name: 'DOCTOR_ARRIVED', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Dr. {{doctorName}} has arrived at Room {{roomNumber}}. Token #{{tokenNumber}} for {{patientName}}. Please proceed to the consultation area.'
+            content: 'SL Medi Flow: Dr. {{doctorName}} has arrived at Room {{roomNumber}}. Token #{{tokenNumber}} for {{patientName}}. Please proceed to the consultation area.'
           };
         } else if (templateName === 'LAB_REPORT_READY') {
           template = {
             id: 'temp', name: 'LAB_REPORT_READY', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Lab report for {{patientName}} ({{testProfile}}) is ready. View report: {{reportLink}} Barcode: {{referenceNo}}'
+            content: 'SL Medi Flow: Lab report for {{patientName}} ({{testProfile}}) is ready. View report: {{reportLink}} Barcode: {{referenceNo}}'
           };
         } else if (templateName === 'PATIENT_PORTAL_OTP') {
           template = {
             id: 'temp', name: 'PATIENT_PORTAL_OTP', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Your verification code is {{otp}}. Valid for 5 minutes. Do not share this OTP with anyone.'
+            content: 'SL Medi Flow: Your verification code is {{otp}}. Valid for 5 minutes. Do not share this OTP with anyone.'
           };
         } else if (templateName === 'SESSION_CANCELLED') {
           template = {
             id: 'temp', name: 'SESSION_CANCELLED', isActive: true, createdAt: new Date(), updatedAt: new Date(),
-            content: 'AMAZ Hospital: Appointment for {{patientName}} with Dr. {{doctorName}} on {{date}} is cancelled ({{reason}}). Inquiries: 0472239090'
+            content: 'SL Medi Flow: Appointment for {{patientName}} with Dr. {{doctorName}} on {{date}} is cancelled ({{reason}}). Inquiries: +94 11 234 5678'
           };
         } else {
           console.warn(`SMS Template ${templateName} not found in DB and no fallback available.`);

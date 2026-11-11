@@ -29,7 +29,7 @@ async function seedDashboard() {
         doctor = await prisma.user.create({
           data: {
             fullName: "Dr. Smith",
-            email: "dr.smith@amaz.com",
+            email: "dr.smith@slmediflow.com",
             password: "hashedpassword",
             specialty: "Cardiology",
             roleId: role.id

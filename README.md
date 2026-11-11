@@ -1,6 +1,6 @@
-# Amaz Hospital - Backend Server
+# SL MediFlow - Backend Server
 
-The backend of the Amaz Hospital Management System. This is a monolithic Node.js and Express application powered by Prisma and a NeonDB PostgreSQL database. It supports real-time features using WebSockets and handles everything from centralized billing logic to live prescription routing.
+The backend of the SL MediFlow Healthcare Management System. This is a monolithic Node.js and Express application powered by Prisma and a PostgreSQL database. It supports real-time features using WebSockets and handles everything from centralized billing logic to live prescription routing.
 
 ## Technology Stack
 

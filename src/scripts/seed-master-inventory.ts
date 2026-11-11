@@ -120,7 +120,7 @@ export function loadAndNormalizeInventory(customPath?: string): CleanedDrugItem[
     path.resolve(process.cwd(), "../Docs/medical_drug_input_template.xlsx"),
     path.resolve(process.cwd(), "Docs/medical_drug_input_template.xlsx"),
     path.resolve(process.cwd(), "../../Docs/medical_drug_input_template.xlsx"),
-    "/var/www/amaz-hospital/Docs/medical_drug_input_template.xlsx"
+    "/var/www/sl-mediflow/Docs/medical_drug_input_template.xlsx"
   ].filter(Boolean) as string[];
 
   let excelPath: string | null = null;

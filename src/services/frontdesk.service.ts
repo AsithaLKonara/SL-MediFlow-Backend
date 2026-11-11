@@ -179,7 +179,7 @@ export class FrontdeskService {
                   doctorName: apt.User?.fullName || 'Doctor',
                   date: targetDate.toLocaleDateString(),
                   reason: 'Doctor had to leave early due to an emergency.',
-                  hospitalName: "AMAZ Hospital"
+                  hospitalName: "SL Medi Flow"
                 }
               ).catch(console.error);
             }
@@ -819,7 +819,7 @@ export class FrontdeskService {
             doctorName: apt.User?.fullName || 'Doctor',
             date: date,
             reason: reason,
-            hospitalName: "AMAZ Hospital"
+            hospitalName: "SL Medi Flow"
           }
         ).catch(console.error);
       }

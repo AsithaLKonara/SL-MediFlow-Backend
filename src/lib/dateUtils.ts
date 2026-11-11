@@ -1,6 +1,6 @@
 /**
  * Helper to get timezone-aware start of day (midnight) and end of day.
- * If TIMEZONE env var is not set, defaults to Asia/Colombo for AMAZ Hospital.
+ * If TIMEZONE env var is not set, defaults to Asia/Colombo for SL MediFlow.
  */
 export function getTimezoneBoundaries(dateInput: Date | string = new Date(), timezone: string = process.env.TIMEZONE || 'Asia/Colombo') {
   let date: Date;

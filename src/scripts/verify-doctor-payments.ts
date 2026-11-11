@@ -20,7 +20,7 @@ async function runDoctorPaymentVerification() {
     });
   }
 
-  const doctorEmail = "dr.perera.test@amazhospital.com";
+  const doctorEmail = "dr.perera.test@slmediflow.com";
   let doctor = await prisma.user.findUnique({
     where: { email: doctorEmail }
   });
@@ -58,7 +58,7 @@ async function runDoctorPaymentVerification() {
     where: { name: { in: ["SUPERADMIN", "ADMIN", "Superadmin", "Admin"] } }
   });
 
-  const officerEmail = "fund.officer.test@amazhospital.com";
+  const officerEmail = "fund.officer.test@slmediflow.com";
   let officer = await prisma.user.findUnique({ where: { email: officerEmail } });
   if (!officer) {
     officer = await prisma.user.create({
@@ -71,7 +71,7 @@ async function runDoctorPaymentVerification() {
     });
   }
 
-  const approverEmail = "medical.director.test@amazhospital.com";
+  const approverEmail = "medical.director.test@slmediflow.com";
   let approver = await prisma.user.findUnique({ where: { email: approverEmail } });
   if (!approver) {
     approver = await prisma.user.create({

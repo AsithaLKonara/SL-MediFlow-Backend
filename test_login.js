@@ -10,11 +10,11 @@ async function testLogin(email, password) {
 }
 
 async function main() {
-  await testLogin('admin@amaz.com', 'password123');
-  await testLogin('doctor@amaz.com', 'password123');
-  await testLogin('frontdesk@amaz.com', 'password123');
-  await testLogin('reception@amaz.com', 'password123');
-  await testLogin('labtech@amaz.com', 'password123');
+  await testLogin('admin@slmediflow.com', 'password123');
+  await testLogin('doctor@slmediflow.com', 'password123');
+  await testLogin('frontdesk@slmediflow.com', 'password123');
+  await testLogin('reception@slmediflow.com', 'password123');
+  await testLogin('labtech@slmediflow.com', 'password123');
 }
 
 main();

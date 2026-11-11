@@ -69,10 +69,10 @@ async function main() {
   const password = await bcrypt.hash('password123', salt);
 
   const staffUsersData = [
-    { email: 'admin@amaz.com', fullName: 'System Admin', role: 'Superadmin' },
-    { email: 'reception@amaz.com', fullName: 'Alice Reception', role: 'Receptionist' },
-    { email: 'labtech@amaz.com', fullName: 'Charlie Lab', role: 'LabTech' },
-    { email: 'nurse@amaz.com', fullName: 'Nancy Nurse', role: 'Nurse' },
+    { email: 'admin@slmediflow.com', fullName: 'System Admin', role: 'Superadmin' },
+    { email: 'reception@slmediflow.com', fullName: 'Alice Reception', role: 'Receptionist' },
+    { email: 'labtech@slmediflow.com', fullName: 'Charlie Lab', role: 'LabTech' },
+    { email: 'nurse@slmediflow.com', fullName: 'Nancy Nurse', role: 'Nurse' },
   ];
 
   await Promise.all(staffUsersData.map(u => {
@@ -90,7 +90,7 @@ async function main() {
     const dept = departments.find(d => d.name === (spec === 'General' ? 'OPD' : spec.toUpperCase()));
     const doc = await prisma.user.create({
       data: {
-        email: `dr${i}@amaz.com`,
+        email: `dr${i}@slmediflow.com`,
         fullName: `Dr. ${getRandomName()}`,
         password,
         roleId: doctorRole!.id,
@@ -140,7 +140,7 @@ async function main() {
   }
 
   // Also create employee profile and compensation for Nancy Nurse
-  const nurseUser = await prisma.user.findUnique({ where: { email: 'nurse@amaz.com' } });
+  const nurseUser = await prisma.user.findUnique({ where: { email: 'nurse@slmediflow.com' } });
   if (nurseUser) {
     const profile = await prisma.employeeProfile.upsert({
       where: { userId: nurseUser.id },

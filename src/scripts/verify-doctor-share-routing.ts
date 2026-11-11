@@ -25,7 +25,7 @@ async function verifyDoctorShareRouting() {
     where: { id: doctor.id },
     data: {
       bankName: "Bank of Ceylon",
-      bankBranch: "Tissamaharama",
+      bankBranch: "Colombo 07",
       bankAccountNumber: "7001234567",
       bankAccountName: `Dr. ${doctor.fullName}`
     }
@@ -276,7 +276,7 @@ async function verifyDoctorShareRouting() {
       paymentReference: bankTxnRef,
       bankDetails: {
         bankName: doctor.bankName || "Bank of Ceylon",
-        bankBranch: "Tissamaharama",
+        bankBranch: "Colombo 07",
         bankAccountNumber: "7001234567",
         bankAccountName: `Dr. ${doctor.fullName}`
       },

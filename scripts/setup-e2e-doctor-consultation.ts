@@ -33,7 +33,7 @@ async function run() {
     }
     doctor = await prisma.user.create({
       data: {
-        email: `testdoctor_${Date.now()}@amaz.com`,
+        email: `testdoctor_${Date.now()}@slmediflow.com`,
         password: "$2a$10$hashedpassworddummy",
         fullName: "Dr. E2E Specialist",
         roleId: docRole.id,

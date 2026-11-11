@@ -13,14 +13,14 @@ async function main() {
   }
 
   const doctorsToSeed = [
-    { email: 'sarah.connor@amaz.com', fullName: 'Dr. Sarah Connor', specialty: 'Neurology', roomNumber: 'Room 101' },
-    { email: 'alan.grant@amaz.com', fullName: 'Dr. Alan Grant', specialty: 'Orthopedics', roomNumber: 'Room 102' },
-    { email: 'ellie.sattler@amaz.com', fullName: 'Dr. Ellie Sattler', specialty: 'Pediatrics', roomNumber: 'Room 103' },
-    { email: 'ian.malcolm@amaz.com', fullName: 'Dr. Ian Malcolm', specialty: 'Cardiology', roomNumber: 'Room 104' },
-    { email: 'john.hammond@amaz.com', fullName: 'Dr. John Hammond', specialty: 'General Surgery', roomNumber: 'Room 105' },
-    { email: 'lex.murphy@amaz.com', fullName: 'Dr. Lex Murphy', specialty: 'Dermatology', roomNumber: 'Room 106' },
-    { email: 'tim.murphy@amaz.com', fullName: 'Dr. Tim Murphy', specialty: 'Psychiatry', roomNumber: 'Room 107' },
-    { email: 'ray.arnold@amaz.com', fullName: 'Dr. Ray Arnold', specialty: 'Ophthalmology', roomNumber: 'Room 108' }
+    { email: 'sarah.connor@slmediflow.com', fullName: 'Dr. Sarah Connor', specialty: 'Neurology', roomNumber: 'Room 101' },
+    { email: 'alan.grant@slmediflow.com', fullName: 'Dr. Alan Grant', specialty: 'Orthopedics', roomNumber: 'Room 102' },
+    { email: 'ellie.sattler@slmediflow.com', fullName: 'Dr. Ellie Sattler', specialty: 'Pediatrics', roomNumber: 'Room 103' },
+    { email: 'ian.malcolm@slmediflow.com', fullName: 'Dr. Ian Malcolm', specialty: 'Cardiology', roomNumber: 'Room 104' },
+    { email: 'john.hammond@slmediflow.com', fullName: 'Dr. John Hammond', specialty: 'General Surgery', roomNumber: 'Room 105' },
+    { email: 'lex.murphy@slmediflow.com', fullName: 'Dr. Lex Murphy', specialty: 'Dermatology', roomNumber: 'Room 106' },
+    { email: 'tim.murphy@slmediflow.com', fullName: 'Dr. Tim Murphy', specialty: 'Psychiatry', roomNumber: 'Room 107' },
+    { email: 'ray.arnold@slmediflow.com', fullName: 'Dr. Ray Arnold', specialty: 'Ophthalmology', roomNumber: 'Room 108' }
   ];
 
   console.log(`Preparing to seed ${doctorsToSeed.length} doctors...`);

@@ -18,7 +18,7 @@ async function testSMS() {
         recipient: formattedPhone,
         sender_id: 'TextLKDemo',
         type: 'plain',
-        message: 'This is a test message from AMAZ Hospital Management System.',
+        message: 'This is a test message from SL MediFlow Healthcare System.',
       },
       {
         headers: {

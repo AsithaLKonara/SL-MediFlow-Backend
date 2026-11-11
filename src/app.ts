@@ -15,6 +15,8 @@ const configuredFrontends = (process.env.FRONTEND_URL || "")
 
 const allowedOrigins = [
     ...configuredFrontends,
+    "https://slmediflow.lk",
+    "https://www.slmediflow.lk",
     "https://amazhospital.lk",
     "https://www.amazhospital.lk",
     "http://localhost:3000",
@@ -33,6 +35,7 @@ app.use(
                 allowedOrigins.some((o) => o.replace(/\/$/, "") === normalizedOrigin) ||
                 origin.endsWith(".up.railway.app") ||
                 origin.endsWith(".vercel.app") ||
+                origin.endsWith(".slmediflow.lk") ||
                 origin.endsWith(".amazhospital.lk") ||
                 origin.endsWith(".onrender.com");
 
@@ -92,7 +95,7 @@ app.get("/health", async (_req, res) => {
         await prisma.$queryRaw`SELECT 1`;
         res.json({
             success: true,
-            message: "Amaz Hospital API and Database are running",
+            message: "SL MediFlow API and Database are running",
         });
     } catch (error) {
         console.error("Health check failed:", error);

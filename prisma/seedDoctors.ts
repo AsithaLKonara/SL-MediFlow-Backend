@@ -15,9 +15,9 @@ async function main() {
   }
 
   const doctors = [
-    { fullName: 'Dr. John Doe', email: 'johndoe@amazhospital.com' },
-    { fullName: 'Dr. Jane Smith', email: 'janesmith@amazhospital.com' },
-    { fullName: 'Dr. Robert Brown', email: 'robertbrown@amazhospital.com' },
+    { fullName: 'Dr. John Doe', email: 'johndoe@slmediflow.com' },
+    { fullName: 'Dr. Jane Smith', email: 'janesmith@slmediflow.com' },
+    { fullName: 'Dr. Robert Brown', email: 'robertbrown@slmediflow.com' },
   ];
 
   for (const d of doctors) {

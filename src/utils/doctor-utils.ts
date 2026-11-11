@@ -1,5 +1,5 @@
 /**
- * Utilities for Doctor handling and sorting across AMAZ Hospital
+ * Utilities for Doctor handling and sorting across SL MediFlow
  */
 
 export function isOpdDoctor(doc: { 

@@ -55,7 +55,7 @@ export const requestOTP = async (req: Request, res: Response) => {
       { otp }
     ).catch((err) => {
       console.error("Failed to send portal OTP SMS:", err);
-      SMSService.sendSMS(targetPhone, `AMAZ Hospital: Your verification code is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`).catch(() => {});
+      SMSService.sendSMS(targetPhone, `SL Medi Flow: Your verification code is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`).catch(() => {});
     });
 
     res.json({ 

@@ -123,7 +123,7 @@ async function seedData() {
           let email = parts[3];
           if (!email || email === '[EMAIL_ADDRESS]') {
             const sanitizedName = doctorName.toLowerCase().replace(/[^a-z]/g, '');
-            email = `${sanitizedName}@amaz.com`;
+            email = `${sanitizedName}@slmediflow.com`;
           }
           let pass = parts[4];
           if (!pass || pass === 'password123') {

@@ -473,7 +473,7 @@ export class BookingService {
               tokenNumber: String(token.tokenNumber),
               bookingRef: token.bookingReference || String(token.tokenNumber),
               barcode: token.bookingReference || String(token.tokenNumber),
-              hospitalName: "AMAZ Hospital"
+              hospitalName: "SL Medi Flow"
             }
           );
         } catch (e) {

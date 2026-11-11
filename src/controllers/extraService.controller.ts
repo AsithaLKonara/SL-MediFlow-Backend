@@ -293,7 +293,7 @@ export const extraServiceController = {
         );
       } catch (s3Err) {
         console.warn("S3 Upload fallback triggered:", s3Err);
-        reportUrl = `https://storage.amazhospital.com/${s3Key}`;
+        reportUrl = `https://storage.slmediflow.com/${s3Key}`;
       }
 
       // Try updating Appointment first

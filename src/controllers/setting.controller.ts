@@ -19,7 +19,7 @@ export const getSettings = async (req: Request, res: Response) => {
 
 export const updateSettings = async (req: Request, res: Response) => {
   try {
-    const updates = req.body; // e.g. { hospitalName: "AMAZ", currency: "usd" }
+    const updates = req.body; // e.g. { hospitalName: "SL MediFlow", currency: "lkr" }
     
     await prisma.$transaction(
       Object.entries(updates).map(([key, value]) => {
