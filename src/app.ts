@@ -15,6 +15,8 @@ const configuredFrontends = (process.env.FRONTEND_URL || "")
 
 const allowedOrigins = [
     ...configuredFrontends,
+    "https://medi.xonitspace.com",
+    "http://medi.xonitspace.com",
     "https://slmediflow.lk",
     "https://www.slmediflow.lk",
     "https://amazhospital.lk",
@@ -33,6 +35,7 @@ app.use(
             const normalizedOrigin = origin.replace(/\/$/, "");
             const isAllowed =
                 allowedOrigins.some((o) => o.replace(/\/$/, "") === normalizedOrigin) ||
+                origin.endsWith(".xonitspace.com") ||
                 origin.endsWith(".up.railway.app") ||
                 origin.endsWith(".vercel.app") ||
                 origin.endsWith(".slmediflow.lk") ||
