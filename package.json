@@ -9,6 +9,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "seed:inventory": "tsx src/scripts/seed-master-inventory.ts",
+    "seed:demo": "tsx prisma/seed-demo.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
