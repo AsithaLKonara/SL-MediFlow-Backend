@@ -81,7 +81,7 @@ export const cacheMiddleware = (durationInSeconds: number = 60, isUserSpecific: 
 
 export const clearCache = async (pattern: string) => {
     try {
-        const cleanPattern = pattern.replace(/^\//, "");
+        const cleanPattern = pattern.replace(/^\//, "").replace(/\*/g, "");
         
         // Clear memory cache
         for (const k of memoryCache.keys()) {
@@ -92,7 +92,8 @@ export const clearCache = async (pattern: string) => {
 
         // Clear Redis cache
         if (redisClient.isReady) {
-            const keys = await redisClient.keys(`cache:*${cleanPattern}*`);
+            const redisPattern = pattern.startsWith("*") ? `cache:${pattern}` : `cache:*${cleanPattern}*`;
+            const keys = await redisClient.keys(redisPattern);
             if (keys.length > 0) {
                 await redisClient.del(keys);
             }
