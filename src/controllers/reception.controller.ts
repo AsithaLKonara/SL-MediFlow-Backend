@@ -341,6 +341,8 @@ export const generateToken = async (req: Request, res: Response) => {
       doctorId, 
       sessionId: requestedSessionId,
       doctorName, 
+      isUpfront: requestedIsUpfront,
+      doctorFee: requestedDoctorFee,
       testIds, 
       customLabPrices, 
       serviceIds, 
@@ -495,7 +497,15 @@ export const generateToken = async (req: Request, res: Response) => {
     }
 
     const isNonOPD = doctorDetails && doctorDetails.specialty && doctorDetails.specialty !== "General" && doctorDetails.specialty.toUpperCase() !== "OPD";
-    const needsInvoice = isNonOPD || hasLab || hasService;
+    const isUpfrontConsultation = Boolean(
+      hasConsultation && (
+        requestedIsUpfront === true ||
+        doctorDetails?.feeType === "UPFRONT" ||
+        (isNonOPD && doctorDetails?.feeType !== "POST_PAY") ||
+        (requestedDoctorFee !== undefined && Number(requestedDoctorFee) > 0 && requestedIsUpfront !== false)
+      )
+    );
+    const needsInvoice = isUpfrontConsultation || hasLab || hasService;
 
     let sharedRefNo = Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
@@ -844,19 +854,23 @@ export const generateToken = async (req: Request, res: Response) => {
       const lineItems = [];
       let totalAmount = 0;
 
-      if (isNonOPD && doctorDetails?.feeType === "UPFRONT") {
-        const fee = doctorDetails.consultationFee || 2500;
+      if (isUpfrontConsultation) {
+        const fee = (requestedDoctorFee !== undefined && Number(requestedDoctorFee) > 0)
+          ? Number(requestedDoctorFee)
+          : (doctorDetails?.consultationFee || 2500);
+        const description = isNonOPD
+          ? `Specialist Consultation (Upfront) - ${doctorName || doctorDetails?.fullName || "Doctor"}`
+          : `Consultation - Dr. ${doctorDetails?.fullName || doctorName || "Doctor"}`;
         lineItems.push({
           department: "CONSULTATION",
-          description: `Specialist Consultation (Upfront) - ${doctorName}`,
+          referenceId: doctorId || undefined,
+          description: description,
           quantity: 1,
           unitPrice: fee,
           total: fee
         });
         totalAmount = Math.round((totalAmount + fee) * 100) / 100;
       }
-
-
 
       if (hasService) {
         extraServicesDetails.forEach(svc => {
@@ -876,35 +890,7 @@ export const generateToken = async (req: Request, res: Response) => {
       }
 
       if (hasLab) {
-        // Deduplication check: check if patient already has active lab requests for today / visit
-        const alreadyBookedTestIds = new Set<string>();
-        if (patient.id) {
-          const colomboDateStr = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Colombo" });
-          const startOfDay = new Date(`${colomboDateStr}T00:00:00+05:30`);
-          const endOfDay = new Date(`${colomboDateStr}T23:59:59.999+05:30`);
-
-          const existingPatientLabs = await prisma.labRequest.findMany({
-            where: {
-              patientId: patient.id,
-              status: { not: "CANCELLED" },
-              requestedAt: { gte: startOfDay, lte: endOfDay }
-            },
-            include: { items: true }
-          });
-          existingPatientLabs.forEach(lr => {
-            lr.items.forEach(item => {
-              alreadyBookedTestIds.add(item.labTestId);
-            });
-          });
-        }
-
         labTestsDetails.forEach(test => {
-          // If already ordered & active for today's visit, skip duplicate billing charge
-          if (alreadyBookedTestIds.has(test.id)) {
-            console.log(`[Frontdesk] Deduplication: Lab test ${test.name} already booked for patient ${patient.id}. Skipping duplicate billing charge.`);
-            return;
-          }
-
           const finalPrice = customLabPrices && customLabPrices[test.id] !== undefined 
             ? Number(customLabPrices[test.id]) 
             : test.price;
