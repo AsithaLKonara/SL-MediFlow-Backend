@@ -1959,7 +1959,10 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
         where: {
           disbursedById: user.id,
           updatedAt: { gte: shift.openedAt },
-          cashDisbursed: { gt: 0 }
+          OR: [
+            { cashDisbursed: { gt: 0 } },
+            { bankDisbursed: { gt: 0 } }
+          ]
         },
         include: {
           doctor: {
@@ -2042,11 +2045,13 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
     let labSales = 0;
     let extraServiceSales = 0;
     let otherSales = 0;
+    let totalDiscounts = 0;
 
     const countedInvoices = new Set<string>();
     payments.forEach(p => {
       if (p.invoice && !countedInvoices.has(p.invoice.id)) {
         countedInvoices.add(p.invoice.id);
+        totalDiscounts += (p.invoice.discountAmount || 0);
         (p.invoice.lineItems || []).forEach(li => {
           const tot = li.total || 0;
           const dept = (li.department || "").toUpperCase();
@@ -2160,13 +2165,15 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       netDoctorPayment: doctorPayments.reduce((sum, d) => sum + d.netDoctorPayment, 0)
     };
 
-    // 5. Doctor Cash Disbursements
+    // 5. Doctor Cash & Bank Disbursements
     const totalDoctorCashDisbursed = doctorDisbursements.reduce((sum, d) => sum + (d.cashDisbursed || 0), 0);
+    const totalDoctorBankDisbursed = doctorDisbursements.reduce((sum, d) => sum + (d.bankDisbursed || 0), 0);
     const doctorDisbursementsList = doctorDisbursements.map(d => ({
       id: d.id,
       doctorName: d.doctor?.fullName || "Doctor",
       specialty: d.doctor?.specialty || "",
-      cashDisbursed: d.cashDisbursed,
+      cashDisbursed: d.cashDisbursed || 0,
+      bankDisbursed: d.bankDisbursed || 0,
       disbursedAt: d.updatedAt
     }));
 
@@ -2174,6 +2181,10 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
     const totalCashExpenses = shiftExpenses
       .filter(e => !e.paymentMethod || e.paymentMethod === "CASH")
       .reduce((sum, e) => sum + (e.amount || 0), 0);
+    const outsourceLabCashDisbursed = shiftExpenses
+      .filter(e => (!e.paymentMethod || e.paymentMethod === "CASH") && e.category === "OUTSOURCE_LAB")
+      .reduce((sum, e) => sum + (e.amount || 0), 0);
+    const generalCashExpenses = Math.max(0, totalCashExpenses - outsourceLabCashDisbursed);
     const totalExpenses = shiftExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
 
     // 7. Cash Balance & Drawer Reconciliation
@@ -2227,7 +2238,9 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       nonCashTotal: systemCardTotal + systemBankTotal + systemQrTotal,
       grossSales: totalSales,
       totalSales,
+      totalDiscounts,
       cashRefundsTotal,
+      nonCashRefundsTotal,
       totalRefunds: cashRefundsTotal + nonCashRefundsTotal,
       netSales,
       todayHospitalTotalSales: todayAgg._sum.amount || 0,
@@ -2244,6 +2257,8 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       cashCollected: systemCashTotal,
       cashRefunds: cashRefundsTotal,
       doctorCashDisbursed: totalDoctorCashDisbursed,
+      outsourceLabCashDisbursed,
+      generalCashExpenses,
       cashExpenses: totalCashExpenses,
       totalExpenses,
       expectedCash,
@@ -2264,7 +2279,12 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
 
       // 4. Doctor Payments
       doctorPayments,
-      totalDoctorPayments,
+      totalDoctorPayments: {
+        ...totalDoctorPayments,
+        totalDoctorCashDisbursed,
+        totalDoctorBankDisbursed
+      },
+      doctorBankDisbursed: totalDoctorBankDisbursed,
       doctorDisbursementsList
     };
 
