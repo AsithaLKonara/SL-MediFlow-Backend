@@ -496,12 +496,14 @@ export const generateToken = async (req: Request, res: Response) => {
       });
     }
 
-    const isNonOPD = doctorDetails && doctorDetails.specialty && doctorDetails.specialty !== "General" && doctorDetails.specialty.toUpperCase() !== "OPD";
+    const isNonOPD = Boolean(doctorDetails && doctorDetails.specialty && doctorDetails.specialty !== "General" && doctorDetails.specialty.toUpperCase() !== "OPD");
+    const isPostPayDoctor = doctorDetails?.feeType === "POST" || doctorDetails?.feeType === "POST_PAY" || requestedIsUpfront === false;
     const isUpfrontConsultation = Boolean(
-      hasConsultation && (
+      hasConsultation &&
+      !isPostPayDoctor &&
+      (
         requestedIsUpfront === true ||
         doctorDetails?.feeType === "UPFRONT" ||
-        (isNonOPD && doctorDetails?.feeType !== "POST_PAY") ||
         (requestedDoctorFee !== undefined && Number(requestedDoctorFee) > 0 && requestedIsUpfront !== false)
       )
     );
