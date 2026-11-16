@@ -133,7 +133,7 @@ export const barcodeController = {
                   bookingReference: appointment.bookingReference,
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             } else {
@@ -149,7 +149,7 @@ export const barcodeController = {
                   appointmentDate: { gte: apptStart, lte: apptEnd },
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             }
@@ -319,7 +319,14 @@ export const barcodeController = {
             };
           }
 
-          const consultationPaid = !!paidInvoice;
+          const hasUpfrontPayment = allAppointments.some(
+            (a: any) =>
+              (a.department === "CONSULTATION" || a.id === appointment.id) &&
+              a.Payment &&
+              a.Payment.status === "COMPLETED" &&
+              (a.Payment.amount || 0) > 0
+          );
+          const consultationPaid = !!paidInvoice || hasUpfrontPayment;
 
           const extraServiceItems = (mergedInvoice?.lineItems || []).filter(
             (li: any) => li.department === "EXTRA_SERVICE" || li.department === "SERVICE" || li.department === "OTHER"
