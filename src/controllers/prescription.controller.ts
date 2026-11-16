@@ -474,8 +474,14 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
           const paidInv = invList.find((inv: any) => inv.status === 'PAID');
           fullInvoiceStatus = draftInv ? 'DRAFT' : (paidInv ? 'PAID' : invList[0].status);
 
-          consultationPaid = invList.some((inv: any) => 
-            inv.status === 'PAID' && inv.lineItems?.some((li: any) => li.department === 'CONSULTATION')
+          const hasDraftConsult = invList.some((inv: any) =>
+            inv.status === 'DRAFT' && inv.lineItems?.some((li: any) => li.department === 'CONSULTATION')
+          );
+
+          consultationPaid = !hasDraftConsult && invList.some((inv: any) => 
+            inv.status === 'PAID' && 
+            (inv.totalAmount || 0) > 0 &&
+            inv.lineItems?.some((li: any) => li.department === 'CONSULTATION' && (li.total || 0) > 0)
           );
         }
 
