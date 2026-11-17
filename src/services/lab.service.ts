@@ -1214,9 +1214,31 @@ export class LabService {
         }
       });
 
-      // 2. Mark matching LabRequests as paid
+      // 2. Mark matching LabRequests as paid and auto-advance status to SENT_TO_LAB (DEFECT-LAB-01)
       await prisma.labRequest.updateMany({
-        where: { id: { in: data.requestIds } },
+        where: {
+          id: { in: data.requestIds },
+          OR: [
+            { outsourceStatus: "SAMPLE_COLLECTED" },
+            { outsourceStatus: null }
+          ]
+        },
+        data: {
+          outsourcePaid: true,
+          outsourcePaidAt: now,
+          outsourceReceiptNo: receiptNumber,
+          outsourcePaidTo: data.partnerCenter,
+          outsourcePaidCost: numAmount,
+          outsourceStatus: "SENT_TO_LAB"
+        }
+      });
+
+      // Update payment details for any requests already beyond SAMPLE_COLLECTED
+      await prisma.labRequest.updateMany({
+        where: {
+          id: { in: data.requestIds },
+          outsourceStatus: { notIn: ["SAMPLE_COLLECTED", "SENT_TO_LAB"] }
+        },
         data: {
           outsourcePaid: true,
           outsourcePaidAt: now,
@@ -1224,6 +1246,13 @@ export class LabService {
           outsourcePaidTo: data.partnerCenter,
           outsourcePaidCost: numAmount
         }
+      });
+
+      websocketService.broadcast("outsource_lab_updated", {
+        requestIds: data.requestIds,
+        partnerCenter: data.partnerCenter,
+        receiptNumber,
+        status: "SENT_TO_LAB"
       });
 
       return {
