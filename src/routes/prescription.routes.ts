@@ -2,12 +2,13 @@ import { verifyToken, requireRole } from "../middlewares/auth.middleware.js";
 import { Router } from "express";
 import { createPrescription, getPendingPrescriptions, markPrescriptionDispensed, updatePrescriptionStatus, getPrescriptionHistory, deletePrescription, updatePrescription, getPrescriptionById, addItemToPrescription, updatePrescriptionItem, deletePrescriptionItem } from "../controllers/prescription.controller.js";
 import { cacheMiddleware } from "../middlewares/cache.middleware.js";
+import { clinicalTransactionLimiter } from "../middlewares/rate-limit.middleware.js";
 
 const router = Router();
 
 router.use(verifyToken, requireRole(['SUPERADMIN', 'ADMIN', 'DOCTOR', 'PHARMACIST', 'RECEPTIONIST', 'CASHIER', 'FRONTDESK']));
 
-router.post("/", createPrescription);
+router.post("/", clinicalTransactionLimiter, createPrescription);
 router.get("/", getPrescriptionHistory);
 router.get("/pending", getPendingPrescriptions);
 router.patch("/:id/status", updatePrescriptionStatus);
