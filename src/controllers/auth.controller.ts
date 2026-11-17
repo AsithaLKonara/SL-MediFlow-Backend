@@ -2,38 +2,55 @@ import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { SMSService } from "../services/sms.service.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("JWT_SECRET is not defined in environment variables");
 
 export const forgotPassword = async (req: Request, res: Response): Promise<void> => {
   try {
-    const { email } = req.body;
-    if (!email) {
-      res.status(400).json({ error: "Email is required" });
+    const { email, phone } = req.body;
+    if (!email && !phone) {
+      res.status(400).json({ error: "Email or phone number is required" });
       return;
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
-    const user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    let user = null;
+    if (email) {
+      const normalizedEmail = email.toLowerCase().trim();
+      user = await prisma.user.findUnique({ where: { email: normalizedEmail } });
+    }
+
     if (!user) {
-      // Return success even if user not found to prevent email enumeration
-      res.status(200).json({ message: "If an account with that email exists, a reset link has been sent." });
+      // Return generic success to prevent user enumeration
+      res.status(200).json({ message: "If an account matching those details exists, a reset link has been dispatched." });
       return;
     }
 
-    // Generate short-lived JWT for password reset
+    // Generate short-lived JWT for password reset (15 minutes)
     const resetToken = jwt.sign(
       { id: user.id, email: user.email, purpose: "PASSWORD_RESET" },
       JWT_SECRET,
       { expiresIn: "15m" }
     );
 
-    // In a real application, send this via email/SMS. 
-    // Since we don't have a mailer configured, we'll log it for development/audit purposes.
-    console.log(`Password reset link: /reset-password?token=${resetToken}`);
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const resetLink = `${frontendUrl}/reset-password?token=${resetToken}`;
+
+    // Dispatch via SMS if recipient phone number provided
+    if (phone) {
+      const smsMessage = `AMAZ Hospital: Your password reset link is ${resetLink}. Valid for 15 minutes. Do not share this link.`;
+      SMSService.sendSMS(phone, smsMessage).catch((err: any) => {
+        console.error("Failed to dispatch password reset SMS:", err);
+      });
+    }
+
+    // Sanitize production logging (only log link during development)
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[AUTH-DEV] Password reset link for ${user.email}: ${resetLink}`);
+    }
     
-    res.status(200).json({ message: "If an account with that email exists, a reset link has been sent." });
+    res.status(200).json({ message: "If an account matching those details exists, a reset link has been dispatched." });
   } catch (error) {
     console.error("Forgot Password Error:", error);
     res.status(500).json({ message: "Internal server error" });
