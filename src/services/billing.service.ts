@@ -503,7 +503,19 @@ export class BillingService {
   async getCashierMetrics() {
     const { startOfDay } = getTimezoneBoundaries();
 
-    const [pendingInvoices, completedToday, todayGrossRevenueObj, recentPayments, pendingDrafts, todayRefundsObj] = await Promise.all([
+    const [
+      pendingInvoices,
+      completedToday,
+      todayGrossRevenueObj,
+      recentPayments,
+      pendingDrafts,
+      todayRefundsObj,
+      todayCashRevenueObj,
+      todayCashRefundsObj,
+      todayCashExpensesObj,
+      todayDoctorCashDisbursedObj,
+      activeShiftsFloatObj
+    ] = await Promise.all([
       prisma.invoice.aggregate({
         where: { status: 'DRAFT' },
         _count: { _all: true }
@@ -529,13 +541,64 @@ export class BillingService {
       prisma.refund.aggregate({
         where: { createdAt: { gte: startOfDay }, status: 'COMPLETED' },
         _sum: { amount: true }
+      }),
+      // Aggregate real cash payments
+      prisma.payment.aggregate({
+        where: {
+          createdAt: { gte: startOfDay },
+          status: { in: ['COMPLETED', 'REFUNDED'] },
+          method: { equals: 'CASH', mode: 'insensitive' }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate real cash refunds
+      prisma.refund.aggregate({
+        where: {
+          createdAt: { gte: startOfDay },
+          status: 'COMPLETED',
+          payment: {
+            method: { equals: 'CASH', mode: 'insensitive' }
+          }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate real cash expenses/cashouts from drawer
+      prisma.expense.aggregate({
+        where: {
+          date: { gte: startOfDay },
+          status: 'COMPLETED',
+          paymentMethod: { equals: 'CASH', mode: 'insensitive' }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate doctor cash share disbursements
+      prisma.doctorDailySheet.aggregate({
+        where: {
+          paidAt: { gte: startOfDay },
+          cashDisbursed: { gt: 0 }
+        },
+        _sum: { cashDisbursed: true }
+      }),
+      // Aggregate active open cash register shifts opening float
+      prisma.cashRegisterShift.aggregate({
+        where: { status: 'OPEN' },
+        _sum: { openingFloat: true }
       })
     ]);
 
     const grossRevenue = todayGrossRevenueObj._sum.amount || 0;
     const refunds = todayRefundsObj._sum.amount || 0;
-    const totalRevenue = grossRevenue - refunds;
-    const cashInDrawer = totalRevenue * 0.4; // Estimate 40% is cash for UI purposes
+    const totalRevenue = Math.round((grossRevenue - refunds) * 100) / 100;
+
+    // Exact cash in drawer reconciliation
+    const grossCash = todayCashRevenueObj._sum.amount || 0;
+    const cashRefunds = todayCashRefundsObj._sum.amount || 0;
+    const cashExpenses = todayCashExpensesObj._sum.amount || 0;
+    const docCashDisbursed = todayDoctorCashDisbursedObj._sum.cashDisbursed || 0;
+    const openingFloat = activeShiftsFloatObj._sum.openingFloat || 0;
+
+    const netCashInDrawer = openingFloat + grossCash - cashRefunds - cashExpenses - docCashDisbursed;
+    const cashInDrawer = Math.max(0, Math.round(netCashInDrawer * 100) / 100);
 
     const recentTransactions: any[] = [];
 

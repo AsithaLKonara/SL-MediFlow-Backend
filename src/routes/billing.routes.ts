@@ -8,7 +8,7 @@ const router = Router();
 router.use(verifyToken);
 
 // GET /api/billing/cashier-metrics
-router.get('/cashier-metrics', requireRoleOrPermission(['ADMIN', 'SUPERADMIN', 'CASHIER', 'RECEPTIONIST'], 'READ', 'Billing'), cacheMiddleware(300), billingController.getCashierMetrics.bind(billingController));
+router.get('/cashier-metrics', requireRoleOrPermission(['ADMIN', 'SUPERADMIN', 'CASHIER', 'RECEPTIONIST'], 'READ', 'Billing'), cacheMiddleware(30), billingController.getCashierMetrics.bind(billingController));
 
 // GET /api/billing/invoices?visitId=...
 router.get('/invoices', requireRoleOrPermission(['ADMIN', 'SUPERADMIN', 'CASHIER', 'RECEPTIONIST'], 'READ', 'Billing'), billingController.getInvoice.bind(billingController));

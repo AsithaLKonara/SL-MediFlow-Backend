@@ -37,6 +37,7 @@ export class BillingController {
       await clearCache("/api/finance/dashboard");
       await clearCache("/api/admin/metrics");
       await clearCache("/api/barcode");
+      await clearCache("cashier-metrics");
 
       res.status(201).json(invoice);
     } catch (error: any) {
@@ -96,6 +97,7 @@ export class BillingController {
       await clearCache("/api/finance/dashboard");
       await clearCache("/api/admin/metrics");
       await clearCache("/api/barcode");
+      await clearCache("cashier-metrics");
       
       res.json(updatedInvoice);
     } catch (error: any) {
@@ -172,6 +174,7 @@ export class BillingController {
 
       await clearCache("/api/finance/dashboard");
       await clearCache("/api/admin/metrics");
+      await clearCache("cashier-metrics");
 
       res.status(201).json({
         success: true,
