@@ -1909,6 +1909,18 @@ export const getPOSHistory = async (req: Request, res: Response) => {
 export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
   try {
     const { declaredCash } = req.body;
+    if (
+      declaredCash === undefined ||
+      declaredCash === null ||
+      String(declaredCash).trim() === "" ||
+      isNaN(Number(declaredCash)) ||
+      Number(declaredCash) < 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Please enter a valid non-negative numeric declared cash amount."
+      });
+    }
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Unauthorized" });
     
@@ -2194,7 +2206,7 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
     const totalSales = systemCashTotal + systemCardTotal + systemBankTotal + systemQrTotal;
     const netSales = totalSales - (cashRefundsTotal + nonCashRefundsTotal);
     const expectedCash = startingFloat + systemCashTotal - cashRefundsTotal - totalDoctorCashDisbursed - totalCashExpenses;
-    const actualCash = Number(declaredCash);
+    const actualCash = Math.round(Number(declaredCash) * 100) / 100;
     const variance = actualCash - expectedCash;
     const varianceStatus = Math.abs(variance) < 0.01 ? "BALANCED" : variance > 0 ? "SURPLUS" : "SHORTAGE";
 
