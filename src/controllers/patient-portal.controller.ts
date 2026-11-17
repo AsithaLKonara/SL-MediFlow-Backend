@@ -98,9 +98,29 @@ export const verifyOTP = async (req: Request, res: Response) => {
       return res.status(400).json({ error: "OTP has expired. Please request a new code." });
     }
 
+    // Check if already reached max attempts
+    if (record.attempts >= 5) {
+      await prisma.patientOTP.delete({ where: { id: record.id } }).catch(() => {});
+      return res.status(429).json({ error: "Too many failed attempts. For your security, this verification code has been invalidated. Please request a new code." });
+    }
+
     const inputCode = String(otp).trim();
     if (record.code !== inputCode) {
-      return res.status(400).json({ error: "Invalid verification code. Please check your SMS and try again." });
+      const newAttempts = record.attempts + 1;
+      if (newAttempts >= 5) {
+        await prisma.patientOTP.delete({ where: { id: record.id } }).catch(() => {});
+        return res.status(429).json({ error: "Too many failed attempts. For your security, this verification code has been invalidated. Please request a new code." });
+      }
+
+      await prisma.patientOTP.update({
+        where: { id: record.id },
+        data: { attempts: { increment: 1 } }
+      }).catch(() => {});
+
+      const remaining = 5 - newAttempts;
+      return res.status(400).json({
+        error: `Invalid verification code. You have ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
+      });
     }
 
     // Delete used OTP
