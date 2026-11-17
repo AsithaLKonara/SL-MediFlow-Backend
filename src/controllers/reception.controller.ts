@@ -2037,6 +2037,25 @@ export const getPOSHistory = async (req: Request, res: Response) => {
       }
     });
 
+    const expenses = await prisma.expense.findMany({
+      where: search ? {
+        OR: [
+          { receiptNumber: { contains: search, mode: "insensitive" } },
+          { category: { contains: search, mode: "insensitive" } },
+          { description: { contains: search, mode: "insensitive" } },
+          { id: { contains: search, mode: "insensitive" } },
+          { user: { fullName: { contains: search, mode: "insensitive" } } },
+          ...(timeCondition ? [{ date: timeCondition.createdAt }] : [])
+        ]
+      } : undefined,
+      orderBy: { createdAt: "desc" },
+      take: 100,
+      include: {
+        user: { select: { id: true, fullName: true, email: true } },
+        shift: { select: { id: true, openedAt: true, status: true } }
+      }
+    });
+
     const allPatientIds = Array.from(new Set([
       ...invoices.map(i => i.patientId).filter(Boolean),
       ...appointments.map(a => a.patientId).filter(Boolean)
@@ -2222,6 +2241,45 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           invoice: null
         });
       }
+    });
+
+    // Add cashouts and drawer expenses
+    expenses.forEach(exp => {
+      unifiedItems.push({
+        type: "CASHOUT",
+        id: exp.id,
+        createdAt: exp.date || exp.createdAt,
+        patientId: null,
+        Patient: null,
+        tokenNumber: null,
+        department: "CASHOUT",
+        doctorName: null,
+        category: exp.category,
+        description: exp.description,
+        roomNumber: null,
+        bookingReference: null,
+        appointmentStatus: null,
+        appointmentId: null,
+        invoiceId: exp.receiptNumber || exp.id,
+        receiptNumber: exp.receiptNumber || exp.id,
+        totalAmount: exp.amount,
+        invoiceStatus: exp.status || "COMPLETED",
+        paymentMethod: exp.paymentMethod || "CASH (Drawer)",
+        cashierName: exp.user?.fullName || "Cashier",
+        lineItems: [],
+        token: null,
+        invoice: null,
+        expense: {
+          receiptNumber: exp.receiptNumber || exp.id,
+          category: exp.category,
+          amount: exp.amount,
+          description: exp.description,
+          paymentMethod: exp.paymentMethod || "CASH (Drawer)",
+          cashierName: exp.user?.fullName || "Cashier",
+          shiftRef: exp.shiftId || undefined,
+          timestamp: (exp.date || exp.createdAt).toISOString()
+        }
+      });
     });
 
     unifiedItems.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
