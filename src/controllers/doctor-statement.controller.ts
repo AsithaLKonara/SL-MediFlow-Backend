@@ -1,8 +1,12 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 
-// GET /api/finance/doctor-statements
+/**
+ * @deprecated Legacy doctor settlement mechanism. Standardize on Fund Office DoctorDailySheet.
+ * GET /api/finance/doctor-statements
+ */
 export const getDoctorStatements = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const { doctorId, status, startDate, endDate } = req.query;
 
@@ -38,8 +42,12 @@ export const getDoctorStatements = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/finance/doctor-statements/generate
+/**
+ * @deprecated Legacy doctor statement generator. Use Fund Office DoctorDailySheet for settlements.
+ * POST /api/finance/doctor-statements/generate
+ */
 export const generateDoctorStatements = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const { periodStart, periodEnd, doctorId, commissionRate: inputCommissionRate, commissionType: inputCommissionType } = req.body;
     const authUser = (req as any).user;
@@ -240,8 +248,12 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
   }
 };
 
-// PATCH /api/finance/doctor-statements/:id/status
+/**
+ * @deprecated Legacy doctor settlement status update. Use Fund Office daily sheet disbursement.
+ * PATCH /api/finance/doctor-statements/:id/status
+ */
 export const updateDoctorStatementStatus = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const id = String(req.params.id);
     const { status, paymentMethod, paymentReference, remarks } = req.body;
