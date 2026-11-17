@@ -10,6 +10,8 @@ import { generateIdentityKey } from "../utils/identity.util.js";
 import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 import { sortDoctorsWithOpdFirst, isOpdDoctor } from "../utils/doctor-utils.js";
 import { recordDoctorShareOnPayment } from "./fund-office.controller.js";
+import { pharmacyService } from "../services/pharmacy.service.js";
+import { clearCache } from "../middlewares/cache.middleware.js";
 
 export const openShift = async (req: Request, res: Response) => {
   try {
@@ -1652,6 +1654,325 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
   }
 };
 
+export const posDirectSale = async (req: Request, res: Response) => {
+  try {
+    const {
+      patientId: requestedPatientId,
+      patientName,
+      patientPhone,
+      patientAge,
+      paymentMethod = "CASH",
+      discount,
+      items,
+      notes
+    } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: "Cart items are required for direct sale" });
+    }
+
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
+
+    // 1. Resolve or create Patient
+    let patient: any = null;
+    if (requestedPatientId) {
+      patient = await prisma.patient.findUnique({ where: { id: requestedPatientId } });
+    }
+
+    if (!patient && patientPhone) {
+      patient = await prisma.patient.findFirst({
+        where: { phone: patientPhone.trim() }
+      });
+    }
+
+    if (!patient) {
+      const cleanName = (patientName || "Walk-in Patient").trim();
+      const cleanPhone = (patientPhone || "0000000000").trim();
+      const count = await prisma.patient.count();
+      const generatedPatientId = `PAT-${String(count + 1).padStart(5, "0")}`;
+
+      patient = await prisma.patient.create({
+        data: {
+          patientId: generatedPatientId,
+          fullName: cleanName,
+          phone: cleanPhone,
+          ageFallback: patientAge ? parseInt(patientAge.toString(), 10) : null,
+          gender: "OTHER",
+          isActive: true
+        }
+      });
+    }
+
+    const bookingRef = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+    const generatedTokens: any[] = [];
+    let createdLabRequest: any = null;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const labItems = items.filter((i: any) => i.department === "LAB");
+      const serviceItems = items.filter((i: any) => i.department === "EXTRA_SERVICE");
+      const medicineItems = items.filter((i: any) => i.department === "PHARMACY" || i.isMedicine);
+
+      // --- A. Process Lab Tests ---
+      if (labItems.length > 0) {
+        const labTests = await tx.labTest.findMany({
+          where: { id: { in: labItems.map((i: any) => i.id) } },
+          include: { room: true }
+        });
+
+        if (labTests.length > 0) {
+          const labRooms = await tx.room.findMany({
+            where: { department: "LAB", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultLabRoom = labRooms[0] || null;
+
+          const labGroups = new Map<string, { roomId: string | null; roomNumber: string; testIds: string[] }>();
+          for (const t of labTests) {
+            const assignedRoom = t.room || labRooms.find((r: any) => r.id === t.roomId) || defaultLabRoom;
+            const rId = assignedRoom?.id || "default-lab";
+            const rNum = assignedRoom?.roomNumber || "LAB-A";
+            if (!labGroups.has(rId)) {
+              labGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, testIds: [] });
+            }
+            labGroups.get(rId)!.testIds.push(t.id);
+          }
+
+          for (const [_, grp] of labGroups.entries()) {
+            const isLabA = grp.roomNumber.toUpperCase().includes("A");
+            const isLabB = grp.roomNumber.toUpperCase().includes("B");
+            const prefix = isLabA ? "LA" : isLabB ? "LB" : "LAB";
+
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "LAB",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, "0")}`;
+
+            const labAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: patient.id,
+                department: "LAB",
+                status: "WAITING_FOR_LAB_TEST",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: bookingRef
+              }
+            });
+
+            generatedTokens.push({
+              id: labAppt.id,
+              refNo: bookingRef,
+              tokenNumber: tokenDisplay,
+              department: "LAB",
+              status: labAppt.status,
+              patientName: patient.fullName,
+              roomNumber: grp.roomNumber,
+              appointmentDate: labAppt.appointmentDate
+            });
+          }
+
+          // Create LabRequest so LabTech portal sees the tests immediately
+          createdLabRequest = await tx.labRequest.create({
+            data: {
+              patientId: patient.id,
+              priority: "ROUTINE",
+              status: "PENDING",
+              items: {
+                create: labTests.map((t: any) => {
+                  const cartItem = labItems.find((i: any) => i.id === t.id);
+                  const price = cartItem ? Number(cartItem.price) : Number(t.price) || 0;
+                  return {
+                    labTestId: t.id,
+                    price
+                  };
+                })
+              }
+            },
+            include: { items: true }
+          });
+        }
+      }
+
+      // --- B. Process Extra Services ---
+      if (serviceItems.length > 0) {
+        const extraServices = await tx.extraService.findMany({
+          where: { id: { in: serviceItems.map((i: any) => i.id) } },
+          include: { room: true }
+        });
+
+        if (extraServices.length > 0) {
+          const serviceRooms = await tx.room.findMany({
+            where: { department: "EXTRA_SERVICE", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultServiceRoom = serviceRooms[0] || null;
+
+          const serviceGroups = new Map<string, { roomId: string | null; roomNumber: string; serviceIds: string[] }>();
+          for (const s of extraServices) {
+            const assignedRoom = s.room || serviceRooms.find((r: any) => r.id === s.roomId) || defaultServiceRoom;
+            const rId = assignedRoom?.id || "default-es";
+            const rNum = assignedRoom?.roomNumber || "EXT-01";
+            if (!serviceGroups.has(rId)) {
+              serviceGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, serviceIds: [] });
+            }
+            serviceGroups.get(rId)!.serviceIds.push(s.id);
+          }
+
+          for (const [_, grp] of serviceGroups.entries()) {
+            const prefix = grp.roomNumber.toUpperCase().includes("ECG") ? "ECG" : "EXT";
+
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "EXTRA_SERVICE",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, "0")}`;
+
+            const serviceAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: patient.id,
+                department: "EXTRA_SERVICE",
+                status: "WAITING",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: bookingRef
+              }
+            });
+
+            generatedTokens.push({
+              id: serviceAppt.id,
+              refNo: bookingRef,
+              tokenNumber: tokenDisplay,
+              department: "EXTRA_SERVICE",
+              status: serviceAppt.status,
+              patientName: patient.fullName,
+              roomNumber: grp.roomNumber,
+              appointmentDate: serviceAppt.appointmentDate
+            });
+          }
+        }
+      }
+
+      // --- C. Process Medicine Items (FIFO deduction) ---
+      for (const med of medicineItems) {
+        if (med.id) {
+          try {
+            await pharmacyService.dispenseMedicine(
+              med.id,
+              Number(med.qty) || 1,
+              { skipBilling: true },
+              tx
+            );
+          } catch (err: any) {
+            console.warn(`[posDirectSale] Dispense notice for medicine ${med.id}:`, err.message);
+          }
+        }
+      }
+
+      // --- D. Build Invoice Line Items ---
+      const lineItemsToCreate = items.map((item: any) => {
+        const qty = Number(item.qty) || 1;
+        const unitPrice = Number(item.price) || 0;
+        const total = Math.round(qty * unitPrice * 100) / 100;
+        let desc = item.name || "Item";
+        if (item.department === "LAB" && !desc.toLowerCase().includes("lab test")) {
+          desc = `Lab Test: ${desc}`;
+        } else if (item.department === "EXTRA_SERVICE" && !desc.toLowerCase().includes("service")) {
+          desc = `Service: ${desc}`;
+        }
+
+        return {
+          department: item.department || "EXTRA_SERVICE",
+          referenceId: item.id || undefined,
+          description: desc,
+          quantity: qty,
+          unitPrice,
+          total
+        };
+      });
+
+      const subtotal = Math.round(lineItemsToCreate.reduce((sum: number, li: any) => sum + li.total, 0) * 100) / 100;
+      const discountAmount = Math.max(0, Math.min(subtotal, Number(discount?.amount) || 0));
+      const finalAmount = Math.max(0, Math.round((subtotal - discountAmount) * 100) / 100);
+
+      const shiftId = await getOpenShiftId(((req as any).user)?.id, tx);
+
+      // --- E. Create Paid Invoice and Completed Payment ---
+      const invoice = await tx.invoice.create({
+        data: {
+          visitId: generatedTokens[0]?.id || bookingRef,
+          patientId: patient.id,
+          subtotal,
+          discountAmount,
+          discountType: discount?.type || null,
+          discountValue: discount?.value !== undefined ? Number(discount.value) : null,
+          discountReason: discount?.reason || null,
+          totalAmount: finalAmount,
+          status: "PAID",
+          lineItems: {
+            create: lineItemsToCreate
+          },
+          payments: {
+            create: [{
+              amount: finalAmount,
+              method: paymentMethod || "CASH",
+              status: "COMPLETED",
+              ...(shiftId ? { shiftId } : {})
+            }]
+          }
+        },
+        include: {
+          lineItems: true,
+          payments: true
+        }
+      });
+
+      return {
+        invoice,
+        tokens: generatedTokens,
+        labRequest: createdLabRequest,
+        bookingRef,
+        patient
+      };
+    }, { timeout: 20000, maxWait: 20000 });
+
+    // Announce payment success via WebSockets
+    websocketService.broadcast("pos_payment_success", {
+      invoiceId: result.invoice.id,
+      totalAmount: result.invoice.totalAmount,
+      paymentMethod
+    });
+
+    // Invalidate caches
+    await clearCache("/api/finance/dashboard").catch(() => {});
+    await clearCache("/api/finance/transactions").catch(() => {});
+    await clearCache("/api/admin/metrics").catch(() => {});
+    await clearCache("/api/reception/history").catch(() => {});
+
+    res.status(201).json({
+      success: true,
+      data: {
+        invoice: result.invoice,
+        tokens: result.tokens,
+        bookingReference: result.bookingRef,
+        patient: result.patient
+      }
+    });
+  } catch (error: any) {
+    console.error("Error in posDirectSale:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to process POS direct sale" });
+  }
+};
+
 export const getPOSHistory = async (req: Request, res: Response) => {
   try {
     const search = req.query.search as string || "";
@@ -1827,7 +2148,8 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           }
         });
       } else {
-        // Direct bill (e.g. Pharmacy OTC sale)
+        // Direct bill (e.g. Pharmacy OTC sale, Lab Test, Extra Service)
+        const primaryDept = inv.lineItems?.find((li: any) => li.department)?.department || "PHARMACY";
         unifiedItems.push({
           type: "INVOICE",
           id: inv.id,
@@ -1835,7 +2157,7 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           patientId: inv.patientId,
           Patient: patient,
           tokenNumber: null,
-          department: "PHARMACY",
+          department: primaryDept,
           doctorName: null,
           roomNumber: null,
           bookingReference: null,
