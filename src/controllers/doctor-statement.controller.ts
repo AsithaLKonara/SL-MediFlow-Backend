@@ -105,14 +105,55 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
       let totalConsultations = 0;
 
       for (const inv of paidInvoices) {
-        const consultItem = inv.lineItems?.find((li: any) => li.department === "CONSULTATION");
-        if (consultItem) {
-          const totalRefunds = inv.payments?.reduce((sum: number, p: any) =>
-            sum + (p.refunds?.reduce((rSum: number, r: any) => rSum + r.amount, 0) || 0), 0) || 0;
-          
-          const netRevenue = Math.max(0, (consultItem.total || 0) - totalRefunds);
-          totalCollected += netRevenue;
-          totalConsultations += 1;
+        const consultItems = inv.lineItems?.filter((li: any) => (li.department || "").toUpperCase() === "CONSULTATION") || [];
+        const consultTotal = consultItems.reduce((sum: number, li: any) => sum + (li.total || 0), 0);
+
+        if (consultTotal > 0) {
+          const nonConsultTotal = (inv.lineItems || [])
+            .filter((li: any) => (li.department || "").toUpperCase() !== "CONSULTATION")
+            .reduce((sum: number, li: any) => sum + (li.total || 0), 0);
+
+          // Extract all completed refunds on this invoice
+          const allRefunds: any[] = [];
+          (inv.payments || []).forEach((p: any) => {
+            (p.refunds || []).forEach((r: any) => {
+              if (r.status === "COMPLETED") allRefunds.push(r);
+            });
+          });
+
+          let consultRefundAmount = 0;
+
+          for (const r of allRefunds) {
+            const reason = (r.reason || "").toLowerCase();
+            const isExplicitConsultRefund =
+              reason.includes("consult") ||
+              reason.includes("doctor") ||
+              reason.includes("appointment") ||
+              reason.includes("booking");
+
+            const isExplicitNonConsultRefund =
+              reason.includes("lab") ||
+              reason.includes("pharmacy") ||
+              reason.includes("medicine") ||
+              reason.includes("drug") ||
+              reason.includes("extra") ||
+              reason.includes("test");
+
+            if (isExplicitConsultRefund) {
+              consultRefundAmount += r.amount;
+            } else if (!isExplicitNonConsultRefund) {
+              // Generic refund: absorb non-consultation charges first
+              const excessRefund = Math.max(0, r.amount - nonConsultTotal);
+              consultRefundAmount += excessRefund;
+            }
+          }
+
+          const netRevenue = Math.max(0, Math.round((consultTotal - consultRefundAmount) * 100) / 100);
+
+          if (netRevenue > 0) {
+            totalCollected += netRevenue;
+            totalConsultations += 1;
+          }
         }
       }
 
