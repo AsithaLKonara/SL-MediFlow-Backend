@@ -110,7 +110,6 @@ app.use("/api/finance", financeRoutes);
 app.use("/api/prescriptions", prescriptionRoutes);
 app.use("/api/barcode", barcodeRoutes);
 app.use("/api/auth", authRoutes);
-app.patch("/api/testpatch/:id", (req, res) => { res.send("OK"); });
 app.use("/api/patients", patientRoutes);
 app.use("/api/tokens", tokenRoutes);
 app.use("/api/users", userRoutes);
@@ -136,8 +135,13 @@ app.use((req, res) => {
 
 // Global error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Internal server error", details: err.message });
+    console.error("Unhandled API Error:", err);
+    const isProduction = process.env.NODE_ENV === "production";
+    res.status(err.status || 500).json({
+        success: false,
+        error: isProduction ? "Internal server error" : (err.message || "Internal server error"),
+        ...(isProduction ? {} : { details: err.stack || err.message })
+    });
 });
 
 export default app;
