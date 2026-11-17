@@ -364,8 +364,19 @@ export const createPrescription = async (req: Request, res: Response): Promise<v
               }, tx);
             }
           }
-          // NOTE: Appointment status is NOT changed here. The doctor must explicitly
-          // click "Complete Consultation" to remove the patient from the queue.
+          // Automatically transition linked appointment to COMPLETED upon prescription submission
+          if (visitIds && visitIds.length > 0) {
+            await tx.appointment.updateMany({
+              where: {
+                id: { in: visitIds },
+                status: { in: ["BOOKED", "CHECKED_IN", "IN_PROGRESS"] }
+              },
+              data: {
+                status: "COMPLETED",
+                completedAt: new Date()
+              }
+            });
+          }
         }
 
         return {
@@ -377,6 +388,10 @@ export const createPrescription = async (req: Request, res: Response): Promise<v
 
     // Broadcast via WebSockets
     websocketService.broadcast("prescription_created", newPrescription);
+    websocketService.broadcast("token_status_updated", {
+      patientId: newPrescription.patientId,
+      status: "COMPLETED"
+    });
 
     res.status(201).json(newPrescription);
   } catch (error) {
@@ -1002,6 +1017,27 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
           }
         }
 
+        if (rx.visitId) {
+          const apptIdsToComplete = [rx.visitId];
+          if (bookingRef) {
+            const linked = await tx.appointment.findMany({
+              where: { bookingReference: bookingRef },
+              select: { id: true }
+            });
+            linked.forEach((l: any) => apptIdsToComplete.push(l.id));
+          }
+          await tx.appointment.updateMany({
+            where: {
+              id: { in: apptIdsToComplete },
+              status: { in: ["BOOKED", "CHECKED_IN", "IN_PROGRESS"] }
+            },
+            data: {
+              status: "COMPLETED",
+              completedAt: new Date()
+            }
+          });
+        }
+
         const visitLrs = rx.visitId ? await tx.labRequest.findMany({
           where: { visitId: rx.visitId },
           include: { items: { include: { LabTest: true } } }
@@ -1027,6 +1063,10 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
     // Broadcast via WebSockets to pharmacy and frontdesk
     websocketService.broadcast("prescription_created", updatedRx);
     websocketService.broadcast("prescription_updated", updatedRx);
+    websocketService.broadcast("token_status_updated", {
+      patientId: updatedRx.patientId,
+      status: "COMPLETED"
+    });
 
     res.json(updatedRx);
   } catch (error: any) {
