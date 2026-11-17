@@ -1277,8 +1277,12 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
               labGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, testIds: [] });
             }
             labGroups.get(rId)!.testIds.push(t.id);
+            const desc = t.isOutsideTest
+              ? `Lab Test (Outsourced - ${t.outsourcedCenter || "Partner"}): ${t.name}`
+              : `Lab Test: ${t.name}`;
             addedLineItems.push({
-              description: `Lab Test: ${t.name}`,
+              description: desc,
+              referenceId: t.id,
               quantity: 1,
               unitPrice: Number(t.price) || 0,
               total: Number(t.price) || 0,
@@ -1998,23 +2002,63 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       .map(p => p.invoice?.visitId)
       .filter((id): id is string => Boolean(id));
 
-    const visitAppointments = visitIds.length > 0
-      ? await prisma.appointment.findMany({
-          where: { id: { in: visitIds } },
-          include: {
-            User: {
-              select: {
-                id: true,
-                fullName: true,
-                specialty: true,
-                consultationFee: true,
-                commissionRate: true,
-                commissionType: true
+    // Collect all LAB line items and reference IDs
+    const labLineItems: Array<{ li: any; invoice: any; payment: any }> = [];
+    payments.forEach(p => {
+      (p.invoice?.lineItems || []).forEach(li => {
+        if ((li.department || "").toUpperCase() === "LAB") {
+          labLineItems.push({ li, invoice: p.invoice, payment: p });
+        }
+      });
+    });
+
+    const labRefIds = labLineItems
+      .map(item => item.li.referenceId)
+      .filter((id): id is string => Boolean(id));
+
+    const [visitAppointments, outsideLabTests, relatedLabRequests] = await Promise.all([
+      visitIds.length > 0
+        ? prisma.appointment.findMany({
+            where: { id: { in: visitIds } },
+            include: {
+              User: {
+                select: {
+                  id: true,
+                  fullName: true,
+                  specialty: true,
+                  consultationFee: true,
+                  commissionRate: true,
+                  commissionType: true
+                }
               }
             }
-          }
-        })
-      : [];
+          })
+        : [],
+      prisma.labTest.findMany({
+        where: { isOutsideTest: true }
+      }),
+      (labRefIds.length > 0 || visitIds.length > 0)
+        ? prisma.labRequest.findMany({
+            where: {
+              OR: [
+                ...(labRefIds.length > 0 ? [{ id: { in: labRefIds } }] : []),
+                ...(visitIds.length > 0 ? [{ visitId: { in: visitIds } }] : [])
+              ]
+            },
+            include: {
+              items: {
+                include: { LabTest: true }
+              },
+              Patient: {
+                select: { fullName: true, phone: true }
+              },
+              Visit: {
+                select: { tokenNumber: true, bookingReference: true }
+              }
+            }
+          })
+        : []
+    ]);
 
     const visitMap = new Map<string, any>();
     visitAppointments.forEach(va => visitMap.set(va.id, va));
@@ -2189,6 +2233,199 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
     const generalCashExpenses = Math.max(0, totalCashExpenses - outsourceLabCashDisbursed);
     const totalExpenses = shiftExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
 
+    // 6.5. Outsource Lab Tests & Profit (Hospital Commission) Breakdown
+    const outsideTestByName = new Map<string, any>();
+    const outsideTestById = new Map<string, any>();
+    outsideLabTests.forEach(t => {
+      outsideTestByName.set(t.name.trim().toLowerCase(), t);
+      if (t.code) outsideTestByName.set(t.code.trim().toLowerCase(), t);
+      outsideTestById.set(t.id, t);
+    });
+
+    const labRequestById = new Map<string, any>();
+    const labRequestsByVisitId = new Map<string, any[]>();
+    relatedLabRequests.forEach(lr => {
+      labRequestById.set(lr.id, lr);
+      if (lr.visitId) {
+        const arr = labRequestsByVisitId.get(lr.visitId) || [];
+        arr.push(lr);
+        labRequestsByVisitId.set(lr.visitId, arr);
+      }
+    });
+
+    let outsourceLabGrossSales = 0;
+    let outsourceLabPartnerCost = 0;
+    let outsourceLabCommission = 0;
+
+    const centerAggMap = new Map<string, {
+      centerName: string;
+      testCount: number;
+      grossCollected: number;
+      partnerCost: number;
+      hospitalCommission: number;
+      cashDisbursed: number;
+    }>();
+
+    const outsourceTestItems: Array<{
+      testName: string;
+      centerName: string;
+      tokenNumber?: string;
+      patientName?: string;
+      grossPrice: number;
+      partnerCost: number;
+      commission: number;
+    }> = [];
+
+    const processedLabLineIds = new Set<string>();
+
+    labLineItems.forEach(({ li, invoice, payment }) => {
+      if (processedLabLineIds.has(li.id)) return;
+      processedLabLineIds.add(li.id);
+
+      const qty = li.quantity || 1;
+      const totalAmount = li.total || (li.unitPrice * qty);
+      const descLower = (li.description || "").toLowerCase();
+
+      let matchedTest: any = null;
+      let matchedReq: any = null;
+
+      // 1. By referenceId matching LabTest
+      if (li.referenceId && outsideTestById.has(li.referenceId)) {
+        matchedTest = outsideTestById.get(li.referenceId);
+      }
+
+      // 2. By referenceId matching LabRequest
+      if (!matchedTest && li.referenceId && labRequestById.has(li.referenceId)) {
+        matchedReq = labRequestById.get(li.referenceId);
+        const outsideItem = matchedReq.items?.find((it: any) => it.LabTest?.isOutsideTest);
+        if (outsideItem?.LabTest) {
+          matchedTest = outsideItem.LabTest;
+        }
+      }
+
+      // 3. By visitId matching LabRequest
+      if (!matchedTest && invoice?.visitId && labRequestsByVisitId.has(invoice.visitId)) {
+        const reqs = labRequestsByVisitId.get(invoice.visitId)!;
+        for (const req of reqs) {
+          const outsideItem = req.items?.find((it: any) => {
+            if (!it.LabTest?.isOutsideTest) return false;
+            const tName = (it.LabTest.name || "").toLowerCase();
+            return descLower.includes(tName);
+          }) || req.items?.find((it: any) => it.LabTest?.isOutsideTest);
+          if (outsideItem?.LabTest) {
+            matchedTest = outsideItem.LabTest;
+            matchedReq = req;
+            break;
+          }
+        }
+      }
+
+      // 4. By test name in description
+      if (!matchedTest) {
+        for (const [nameKey, t] of outsideTestByName.entries()) {
+          if (descLower.includes(nameKey)) {
+            matchedTest = t;
+            break;
+          }
+        }
+      }
+
+      const isOutsourcedText = descLower.includes("outsourced") || descLower.includes("outside");
+
+      if (matchedTest || isOutsourcedText) {
+        const cleanName = matchedTest?.name || li.description.replace(/^Lab Test\s*(\(Outsourced[^)]*\))?:\s*/i, "").trim();
+        const centerName = matchedTest?.outsourcedCenter || (
+          descLower.includes("asiri") ? "Asiri Laboratories" :
+          descLower.includes("ruhunu") ? "Ruhunu Hospital" :
+          "Asiri Laboratories"
+        );
+
+        let unitCost = matchedTest?.outsourceCost;
+        if (unitCost === null || unitCost === undefined || unitCost <= 0) {
+          unitCost = Math.round(li.unitPrice * 0.75 * 100) / 100;
+        }
+
+        const totalCost = Math.round(unitCost * qty * 100) / 100;
+        const totalCommission = Math.max(0, Math.round((totalAmount - totalCost) * 100) / 100);
+
+        outsourceLabGrossSales += totalAmount;
+        outsourceLabPartnerCost += totalCost;
+        outsourceLabCommission += totalCommission;
+
+        const currentCenter = centerAggMap.get(centerName) || {
+          centerName,
+          testCount: 0,
+          grossCollected: 0,
+          partnerCost: 0,
+          hospitalCommission: 0,
+          cashDisbursed: 0
+        };
+        currentCenter.testCount += qty;
+        currentCenter.grossCollected += totalAmount;
+        currentCenter.partnerCost += totalCost;
+        currentCenter.hospitalCommission += totalCommission;
+        centerAggMap.set(centerName, currentCenter);
+
+        const patientName = matchedReq?.Patient?.fullName || payment?.Appointment?.Patient?.fullName || invoice?.patient?.fullName || "Patient";
+        const tokenNumber = matchedReq?.Visit?.tokenNumber || payment?.Appointment?.tokenNumber;
+
+        outsourceTestItems.push({
+          testName: cleanName,
+          centerName,
+          tokenNumber,
+          patientName,
+          grossPrice: totalAmount,
+          partnerCost: totalCost,
+          commission: totalCommission
+        });
+      }
+    });
+
+    // Attribute recorded outsource lab expenses to respective partner centers
+    shiftExpenses.forEach(e => {
+      if ((!e.paymentMethod || e.paymentMethod === "CASH") && e.category === "OUTSOURCE_LAB") {
+        const dLower = (e.description || "").toLowerCase();
+        let matchedCenterName: string | null = null;
+        for (const centerName of centerAggMap.keys()) {
+          if (dLower.includes(centerName.toLowerCase())) {
+            matchedCenterName = centerName;
+            break;
+          }
+        }
+        if (!matchedCenterName && centerAggMap.size > 0) {
+          matchedCenterName = Array.from(centerAggMap.keys())[0] || null;
+        }
+        if (matchedCenterName) {
+          const c = centerAggMap.get(matchedCenterName);
+          if (c) c.cashDisbursed += (e.amount || 0);
+        }
+      }
+    });
+
+    const inHouseLabSales = Math.max(0, Math.round((labSales - outsourceLabGrossSales) * 100) / 100);
+
+    const outsourceLabSummary = {
+      totalTests: outsourceTestItems.length,
+      grossCollected: outsourceLabGrossSales,
+      partnerCost: outsourceLabPartnerCost,
+      hospitalCommission: outsourceLabCommission,
+      cashDisbursed: outsourceLabCashDisbursed,
+      pendingDisbursement: Math.max(0, Math.round((outsourceLabPartnerCost - outsourceLabCashDisbursed) * 100) / 100),
+      inHouseLabSales,
+      centers: Array.from(centerAggMap.values()),
+      testItems: outsourceTestItems
+    };
+
+    const hospitalNetEarnings = {
+      doctorCommissions: totalDoctorPayments.hospitalCommission,
+      outsourceLabCommissions: outsourceLabCommission,
+      totalHospitalCommission: totalDoctorPayments.hospitalCommission + outsourceLabCommission,
+      inHouseLabRevenue: inHouseLabSales,
+      pharmacyGrossRevenue: pharmacySales,
+      extraServicesRevenue: extraServiceSales,
+      totalHospitalGrossEarnings: totalDoctorPayments.hospitalCommission + outsourceLabCommission + inHouseLabSales + pharmacySales + extraServiceSales
+    };
+
     // 7. Cash Balance & Drawer Reconciliation
     const startingFloat = shift.openingFloat || 0;
     const totalSales = systemCashTotal + systemCardTotal + systemBankTotal + systemQrTotal;
@@ -2250,6 +2487,8 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
         consultations: consultationSales,
         pharmacy: pharmacySales,
         lab: labSales,
+        inHouseLab: inHouseLabSales,
+        outsourceLab: outsourceLabGrossSales,
         extraServices: extraServiceSales,
         other: otherSales
       },
@@ -2287,7 +2526,13 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
         totalDoctorBankDisbursed
       },
       doctorBankDisbursed: totalDoctorBankDisbursed,
-      doctorDisbursementsList
+      doctorDisbursementsList,
+
+      // 5. Outsource Lab Summary & Profit (Hospital Commission)
+      outsourceLabSummary,
+
+      // 6. Hospital Net Commissions / Retained Earnings
+      hospitalNetEarnings
     };
 
     res.json({ success: true, data: summary });
