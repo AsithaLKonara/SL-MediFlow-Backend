@@ -133,7 +133,7 @@ export const barcodeController = {
                   bookingReference: appointment.bookingReference,
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             } else {
@@ -149,7 +149,7 @@ export const barcodeController = {
                   appointmentDate: { gte: apptStart, lte: apptEnd },
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             }
@@ -255,7 +255,8 @@ export const barcodeController = {
               where: {
                 visitId: { in: allVisitIdentifiers },
                 status: "PAID",
-                lineItems: { some: { department: "CONSULTATION" } }
+                totalAmount: { gt: 0 },
+                lineItems: { some: { department: "CONSULTATION", total: { gt: 0 } } }
               }
             })
           ]);
@@ -319,7 +320,17 @@ export const barcodeController = {
             };
           }
 
-          const consultationPaid = !!paidInvoice;
+          const hasDraftConsult = allLineItems.some(
+            (li: any) => li.department === "CONSULTATION"
+          );
+          const hasUpfrontPayment = allAppointments.some(
+            (a: any) =>
+              (a.department === "CONSULTATION" || a.id === appointment.id) &&
+              a.Payment &&
+              a.Payment.status === "COMPLETED" &&
+              (a.Payment.amount || 0) > 0
+          );
+          const consultationPaid = !hasDraftConsult && (!!paidInvoice || hasUpfrontPayment);
 
           const extraServiceItems = (mergedInvoice?.lineItems || []).filter(
             (li: any) => li.department === "EXTRA_SERVICE" || li.department === "SERVICE" || li.department === "OTHER"
@@ -412,14 +423,25 @@ export const barcodeController = {
 
           let consultationPaid = false;
           if (prescription.visitId) {
-            const paidInvoice = await prisma.invoice.findFirst({
+            const hasDraftConsult = await prisma.invoice.findFirst({
               where: {
                 visitId: prescription.visitId,
-                status: "PAID",
+                status: "DRAFT",
                 lineItems: { some: { department: "CONSULTATION" } }
               }
             });
-            if (paidInvoice) consultationPaid = true;
+
+            if (!hasDraftConsult) {
+              const paidInvoice = await prisma.invoice.findFirst({
+                where: {
+                  visitId: prescription.visitId,
+                  status: "PAID",
+                  totalAmount: { gt: 0 },
+                  lineItems: { some: { department: "CONSULTATION", total: { gt: 0 } } }
+                }
+              });
+              if (paidInvoice) consultationPaid = true;
+            }
           }
 
           return res.json({ 

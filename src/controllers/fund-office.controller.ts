@@ -158,25 +158,47 @@ export const syncOrCreateDailySheet = async (req: Request, res: Response) => {
         orderBy: { bookedAt: "asc" }
       });
 
-      const visitIds = appointments.map((a) => a.id);
+      const visitIdentifiers = Array.from(
+        new Set(appointments.flatMap((a) => [a.id, a.bookingReference].filter(Boolean)))
+      ) as string[];
+
       const paidInvoices = await prisma.invoice.findMany({
         where: {
-          visitId: { in: visitIds },
+          visitId: { in: visitIdentifiers },
           status: "PAID"
         },
         include: { lineItems: true, payments: true }
       });
 
-      if (appointments.length > 0) {
-        itemsToSave = appointments.map((apt) => {
-          const inv = paidInvoices.find((i) => i.visitId === apt.id);
+      const findPaidInvoiceForApt = (apt: any) => {
+        return paidInvoices.find(
+          (i) =>
+            (i.visitId === apt.id || (apt.bookingReference && i.visitId === apt.bookingReference)) &&
+            i.lineItems.some(
+              (li: any) =>
+                li.department === "CONSULTATION" ||
+                li.description?.toLowerCase().includes("consultation")
+            )
+        );
+      };
+
+      // Only include appointments that have actually been paid (either via PAID consultation invoice or completed upfront payment)
+      const paidAppointments = appointments.filter((apt) => {
+        const inv = findPaidInvoiceForApt(apt);
+        const hasPaidPayment = apt.Payment && apt.Payment.status === "COMPLETED" && (apt.Payment.amount || 0) > 0;
+        return !!inv || hasPaidPayment;
+      });
+
+      if (paidAppointments.length > 0) {
+        itemsToSave = paidAppointments.map((apt) => {
+          const inv = findPaidInvoiceForApt(apt);
           const consultLi = inv?.lineItems.find(
             (li: any) =>
               li.department === "CONSULTATION" ||
               li.description?.toLowerCase().includes("consultation")
           );
           const itemFee =
-            consultLi?.total || inv?.totalAmount || apt.Payment?.amount || effectiveFee;
+            consultLi?.total || apt.Payment?.amount || inv?.totalAmount || effectiveFee;
           const { hospitalShare, doctorShare } = calcHospitalAndDoctorShare(itemFee);
 
           const pMethod = (inv?.payments?.[0]?.method || apt.Payment?.method || "CASH").toUpperCase();
@@ -999,9 +1021,16 @@ export async function reverseDoctorShareOnRefund(invoiceId: string) {
  */
 export async function recordCompletedConsultationInDailySheet(appointmentId: string) {
   try {
+    const apt = await prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: { id: true, bookingReference: true }
+    });
+    const visitIds = [appointmentId];
+    if (apt?.bookingReference) visitIds.push(apt.bookingReference);
+
     const invoice = await prisma.invoice.findFirst({
       where: {
-        visitId: appointmentId,
+        visitId: { in: visitIds },
         status: "PAID",
         lineItems: { some: { department: "CONSULTATION" } }
       }
