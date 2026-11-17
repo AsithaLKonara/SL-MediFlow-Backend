@@ -28,7 +28,7 @@ export class FinanceService {
         _sum: { amount: true }
       }),
       prisma.invoice.aggregate({
-        where: { status: 'PENDING' },
+        where: { status: { in: ['DRAFT', 'PENDING'] } },
         _sum: { totalAmount: true }
       }),
       prisma.purchaseOrder.aggregate({
