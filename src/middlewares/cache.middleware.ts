@@ -7,6 +7,30 @@ interface AuthRequest extends Request {
 
 // Resilient in-memory fallback cache
 const memoryCache = new Map<string, { data: string; expiry: number }>();
+export const MAX_MEMORY_CACHE_ENTRIES = 2000;
+
+export function enforceMemoryCacheCapacity(): void {
+    if (memoryCache.size < MAX_MEMORY_CACHE_ENTRIES) return;
+
+    // 1. First sweep: Purge all expired entries
+    const now = Date.now();
+    for (const [k, v] of memoryCache.entries()) {
+        if (v.expiry < now) {
+            memoryCache.delete(k);
+        }
+    }
+
+    // 2. Second sweep: If still at capacity, evict oldest entries (FIFO via Map keys order)
+    if (memoryCache.size >= MAX_MEMORY_CACHE_ENTRIES) {
+        const excess = memoryCache.size - MAX_MEMORY_CACHE_ENTRIES + 100;
+        let evicted = 0;
+        for (const key of memoryCache.keys()) {
+            memoryCache.delete(key);
+            evicted++;
+            if (evicted >= excess) break;
+        }
+    }
+}
 
 // Periodic memory cache garbage collection every 60s
 setInterval(() => {
@@ -63,6 +87,7 @@ export const cacheMiddleware = (durationInSeconds: number = 60, isUserSpecific: 
                     if (redisClient.isReady) {
                         redisClient.setEx(key, durationInSeconds, dataString).catch(() => {});
                     } else {
+                        enforceMemoryCacheCapacity();
                         memoryCache.set(key, {
                             data: dataString,
                             expiry: Date.now() + durationInSeconds * 1000
