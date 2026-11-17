@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { SMSService } from "../services/sms.service.js";
+import { validatePasswordStrength } from "../utils/password.util.js";
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error("JWT_SECRET is not defined in environment variables");
@@ -62,6 +63,12 @@ export const resetPassword = async (req: Request, res: Response): Promise<void> 
     const { token, newPassword } = req.body;
     if (!token || !newPassword) {
       res.status(400).json({ error: "Token and new password are required" });
+      return;
+    }
+
+    const validation = validatePasswordStrength(newPassword);
+    if (!validation.isValid) {
+      res.status(400).json({ error: validation.message });
       return;
     }
 

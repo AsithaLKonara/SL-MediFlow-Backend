@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import bcrypt from "bcryptjs";
+import { validatePasswordStrength } from "../utils/password.util.js";
 import { clearCache } from "../middlewares/cache.middleware.js";
 import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
@@ -113,6 +114,13 @@ export const createStaff = async (req: Request, res: Response) => {
 
     if (departmentId && role.name.toUpperCase() !== 'DOCTOR') {
       return res.status(400).json({ success: false, error: "Only Doctors can be assigned to a department" });
+    }
+
+    if (password) {
+      const validation = validatePasswordStrength(password);
+      if (!validation.isValid) {
+        return res.status(400).json({ success: false, error: validation.message });
+      }
     }
 
     const normalizedEmail = email.trim().toLowerCase();
