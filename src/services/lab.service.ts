@@ -164,13 +164,24 @@ export class LabService {
         throw new Error("One or more tests not found in catalog");
       }
 
+      let effectiveVisitId: string | null = null;
       let effectiveDoctorId = data.doctorId;
-      if (!effectiveDoctorId && data.visitId) {
-        const apt = await prisma.appointment.findUnique({
-          where: { id: data.visitId },
-          select: { doctorId: true }
+      if (data.visitId) {
+        const apt = await prisma.appointment.findFirst({
+          where: {
+            OR: [
+              { id: data.visitId },
+              { bookingReference: data.visitId }
+            ]
+          },
+          select: { id: true, doctorId: true }
         });
-        if (apt?.doctorId) effectiveDoctorId = apt.doctorId;
+        if (apt) {
+          effectiveVisitId = apt.id;
+          if (!effectiveDoctorId && apt.doctorId) {
+            effectiveDoctorId = apt.doctorId;
+          }
+        }
       }
 
       // Deduplication Check: Prevent duplicate lab orders & double billing for same patient in active visit / today
@@ -183,7 +194,8 @@ export class LabService {
           patientId: data.patientId,
           status: { not: "CANCELLED" },
           OR: [
-            ...(data.visitId ? [{ visitId: data.visitId }] : []),
+            ...(effectiveVisitId ? [{ visitId: effectiveVisitId }] : []),
+            ...(data.visitId && data.visitId !== effectiveVisitId ? [{ visitId: data.visitId }] : []),
             { requestedAt: { gte: startOfDay, lte: endOfDay } }
           ]
         },
@@ -221,7 +233,7 @@ export class LabService {
         data: {
           patientId: data.patientId,
           doctorId: effectiveDoctorId,
-          visitId: data.visitId,
+          visitId: effectiveVisitId,
           priority: data.priority || "ROUTINE",
           status: "PENDING",
           items: {
