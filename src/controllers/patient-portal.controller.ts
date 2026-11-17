@@ -39,7 +39,8 @@ export const requestOTP = async (req: Request, res: Response) => {
 
     // Generate real secure 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    const OTP_EXPIRY_MINUTES = 5;
+    const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000); // 5 mins (DEFECT-PORT-01 aligned with SMS text)
 
     await prisma.patientOTP.upsert({
       where: { phone: targetPhone },
@@ -55,12 +56,13 @@ export const requestOTP = async (req: Request, res: Response) => {
       { otp }
     ).catch((err) => {
       console.error("Failed to send portal OTP SMS:", err);
-      SMSService.sendSMS(targetPhone, `AMAZ Hospital: Your verification code is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`).catch(() => {});
+      SMSService.sendSMS(targetPhone, `AMAZ Hospital: Your verification code is ${otp}. Valid for ${OTP_EXPIRY_MINUTES} minutes. Do not share this OTP with anyone.`).catch(() => {});
     });
 
     res.json({ 
       success: true, 
       message: "Verification code sent successfully via SMS",
+      expiresInSeconds: OTP_EXPIRY_MINUTES * 60,
       patients: patients.length > 1 ? patients : undefined
     });
   } catch (error: any) {
