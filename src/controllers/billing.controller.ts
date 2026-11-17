@@ -77,19 +77,27 @@ export class BillingController {
   async payInvoice(req: Request, res: Response) {
     try {
       const { invoiceId } = req.params;
-      const { amount, method, discount } = req.body;
+      const { amount, method, discount, shiftId: bodyShiftId } = req.body;
 
       if (!amount || !method) {
         return res.status(400).json({ error: 'Missing payment amount or method' });
       }
 
       const user = (req as any).user;
-      let shiftId: string | undefined = undefined;
-      if (user) {
+      let shiftId: string | undefined = bodyShiftId;
+      if (!shiftId && user) {
         const shift = await prisma.cashRegisterShift.findFirst({
           where: { openedBy: user.id, status: "OPEN" }
         });
         shiftId = shift?.id;
+      }
+
+      const userRole = (user?.Role?.name || user?.role || "").toUpperCase();
+      const isCashDeskRole = userRole.includes("CASHIER") || userRole.includes("RECEPTION") || userRole.includes("FRONT");
+      if (isCashDeskRole && !shiftId) {
+        return res.status(400).json({
+          error: "You must have an active OPEN cashier shift to process customer payments. Please open your shift first."
+        });
       }
       
       const updatedInvoice = await billingService.payInvoice(invoiceId as string, Number(amount), method as string, shiftId, discount);
