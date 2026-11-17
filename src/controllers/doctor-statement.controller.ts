@@ -80,10 +80,14 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
             { createdAt: { gte: start, lte: end } }
           ],
         },
-        select: { id: true },
+        select: { id: true, bookingReference: true },
       });
 
-      const visitIds = appointments.map(a => a.id);
+      const visitIds = Array.from(
+        new Set(
+          appointments.flatMap(a => [a.id, a.bookingReference].filter(Boolean) as string[])
+        )
+      );
 
       // Find paid invoices for these visits
       const paidInvoices: any[] = await prisma.invoice.findMany({
@@ -103,8 +107,12 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
 
       let totalCollected = 0;
       let totalConsultations = 0;
+      const countedInvoices = new Set<string>();
 
       for (const inv of paidInvoices) {
+        if (countedInvoices.has(inv.id)) continue;
+        countedInvoices.add(inv.id);
+
         const consultItems = inv.lineItems?.filter((li: any) => (li.department || "").toUpperCase() === "CONSULTATION") || [];
         const consultTotal = consultItems.reduce((sum: number, li: any) => sum + (li.total || 0), 0);
 
