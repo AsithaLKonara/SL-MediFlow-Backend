@@ -129,15 +129,36 @@ export class PharmacyService {
   }
 
   // --- DISPENSING ENGINE (FIFO LOGIC) ---
+  /**
+   * Dispense a medicine from stock using FIFO batch ordering.
+   *
+   * For syrups/liquids pass dispensedMl (volume in ml to dispense).
+   * The service converts ml → bottles for stock deduction and bills per-ml.
+   * For solid forms (tablets, capsules, etc.) dispensedMl must be omitted.
+   */
   async dispenseMedicine(
     medicineId: string, 
     quantityToDispense: number,
     billingInfo?: { visitId?: string; patientId?: string; description?: string, skipBilling?: boolean },
-    existingTx?: any
+    existingTx?: any,
+    /** Volume in ml to dispense (syrups/liquids only). When set, overrides qty-based billing. */
+    dispensedMl?: number
   ) {
     const executeLogic = async (tx: any) => {
       // Lock all batches for this medicine to serialize concurrent dispensing
       await tx.$executeRaw`SELECT id FROM "StockBatch" WHERE "medicineId" = ${medicineId} FOR UPDATE`;
+
+      // --- Syrup/liquid path: resolve packSize for ml→bottle conversion ---
+      let packSize = 1; // default: 1 dose-unit per stock unit (tablets)
+      if (dispensedMl && dispensedMl > 0) {
+        const med = await tx.medicine.findUnique({
+          where: { id: medicineId },
+          select: { packSize: true },
+        });
+        packSize = (med?.packSize && med.packSize > 0) ? med.packSize : 1;
+        // Convert requested ml volume to bottles needed (ceil so we always pull enough)
+        quantityToDispense = Math.max(1, Math.ceil(dispensedMl / packSize));
+      }
 
       // 1. Get all available unexpired stock batches for this medicine, ordered by expiry date (FIFO)
       const availableBatches = await tx.stockBatch.findMany({
@@ -157,13 +178,15 @@ export class PharmacyService {
       // 2. Check if we have enough total stock
       const totalAvailable = availableBatches.reduce((sum: number, b: any) => sum + b.currentQuantity, 0);
       if (totalAvailable < quantityToDispense) {
-        throw new Error(`Insufficient stock. Requested: ${quantityToDispense}, Available: ${totalAvailable}`);
+        const availableMl = dispensedMl ? `${totalAvailable * packSize} ml` : `${totalAvailable} units`;
+        const requestedMl = dispensedMl ? `${dispensedMl} ml` : `${quantityToDispense} units`;
+        throw new Error(`Insufficient stock. Requested: ${requestedMl}, Available: ${availableMl}`);
       }
 
       let remainingToDispense = quantityToDispense;
-      const batchesUsed = [];
+      const batchesUsed: Array<{ batchId: string; batchNumber: string; quantityDispensed: number; unitPrice: number }> = [];
 
-      // 3. Loop through batches and deduct stock
+      // 3. Loop through batches and deduct stock (FIFO)
       for (const batch of availableBatches) {
         if (remainingToDispense <= 0) break;
 
@@ -184,8 +207,23 @@ export class PharmacyService {
         remainingToDispense -= quantityFromThisBatch;
       }
 
+      // 4. Calculate billing cost
+      // For syrups: bill proportionally by ml (dispensedMl × pricePerMl)
+      // For solids: bill by whole unit (quantityDispensed × unitPrice)
+      let totalCost: number;
+      if (dispensedMl && dispensedMl > 0 && packSize > 1) {
+        // Weighted average pricePerMl across batches used
+        const totalBottlesBilled = batchesUsed.reduce((s, b) => s + b.quantityDispensed, 0);
+        const weightedBottlePrice = totalBottlesBilled > 0
+          ? batchesUsed.reduce((s, b) => s + (b.quantityDispensed * b.unitPrice), 0) / totalBottlesBilled
+          : 0;
+        const pricePerMl = Number((weightedBottlePrice / packSize).toFixed(4));
+        totalCost = Number((dispensedMl * pricePerMl).toFixed(2));
+      } else {
+        totalCost = batchesUsed.reduce((sum: number, b: any) => sum + (b.quantityDispensed * b.unitPrice), 0);
+      }
+
       if (billingInfo && !billingInfo.skipBilling && (billingInfo.visitId || billingInfo.patientId)) {
-        const totalCost = batchesUsed.reduce((sum: number, b: any) => sum + (b.quantityDispensed * b.unitPrice), 0);
         if (totalCost > 0) {
           await billingService.addCharge({
             visitId: billingInfo.visitId,
@@ -201,9 +239,14 @@ export class PharmacyService {
 
       return {
         success: true,
-        message: `Successfully dispensed ${quantityToDispense} units.`,
+        message: dispensedMl
+          ? `Successfully dispensed ${dispensedMl} ml (${quantityToDispense} bottle(s) deducted).`
+          : `Successfully dispensed ${quantityToDispense} units.`,
         batchesUsed,
-        totalCost: batchesUsed.reduce((sum, b) => sum + (b.quantityDispensed * b.unitPrice), 0)
+        totalCost,
+        /** Present only for syrup dispenses */
+        dispensedMl: dispensedMl ?? null,
+        packSize: dispensedMl ? packSize : null,
       };
     };
 

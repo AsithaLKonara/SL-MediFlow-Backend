@@ -187,23 +187,48 @@ export class PharmacyController {
 
         for (const item of items) {
           const qty = Number(item.qty);
+          // For syrups the POS sends isSyrup=true + syrupVolumeMl; convert ml → bottles for stock deduction
+          const dispensedMl = item.isSyrup && item.syrupVolumeMl ? Number(item.syrupVolumeMl) : undefined;
+
           // Delegate to pharmacyService to ensure row-level locks and FIFO logic are applied securely
           const dispenseResult = await pharmacyService.dispenseMedicine(
             item.id,
             qty,
             { skipBilling: true }, // We do our own bulk billing here
-            tx
+            tx,
+            dispensedMl  // <-- syrup-aware parameter
           );
 
-          const itemQty = Number(item.qty) || 1;
-          const unitPrice = itemQty > 0 ? Number((dispenseResult.totalCost / itemQty).toFixed(2)) : dispenseResult.totalCost;
+          // For syrups: totalCost is already computed as (dispensedMl × pricePerMl) by the service
+          // For solids: use the classic qty-averaged unitPrice
+          let chargeQty: number;
+          let chargeUnitPrice: number;
+          if (dispensedMl && dispensedMl > 0) {
+            // Bill as: 1 line × totalCost (keeps invoice description clean)
+            chargeQty = 1;
+            chargeUnitPrice = dispenseResult.totalCost;
+          } else {
+            chargeQty = qty || 1;
+            chargeUnitPrice = chargeQty > 0 ? Number((dispenseResult.totalCost / chargeQty).toFixed(2)) : dispenseResult.totalCost;
+          }
+
+          // Build a human-readable description for syrups: "Paracetamol Syrup - 25 ml @ LKR 5.00/ml"
+          let chargeDescription = item.name || 'Pharmacy Medication';
+          if (dispensedMl && dispenseResult.packSize && dispenseResult.packSize > 1) {
+            const bottlePrice = dispenseResult.batchesUsed.length > 0
+              ? (dispenseResult.batchesUsed.reduce((s: number, b: any) => s + (b.quantityDispensed * b.unitPrice), 0) /
+                 dispenseResult.batchesUsed.reduce((s: number, b: any) => s + b.quantityDispensed, 0))
+              : 0;
+            const pricePerMl = Number((bottlePrice / dispenseResult.packSize).toFixed(2));
+            chargeDescription = `${item.name} - ${dispensedMl} ml @ LKR ${pricePerMl.toFixed(2)}/ml`;
+          }
 
           charges.push({
             department: 'PHARMACY',
             referenceId: item.id,
-            description: item.name || 'Pharmacy Medication',
-            quantity: itemQty,
-            unitPrice: unitPrice,
+            description: chargeDescription,
+            quantity: chargeQty,
+            unitPrice: chargeUnitPrice,
             medicineId: item.id,
           });
         }
