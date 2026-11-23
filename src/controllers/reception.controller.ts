@@ -281,7 +281,10 @@ export const getPatientById = async (req: Request, res: Response): Promise<void>
           orderBy: { createdAt: "desc" }
         },
         LabRequests: {
-          include: { items: { include: { LabTest: true } } },
+          include: { 
+            items: { include: { LabTest: true } },
+            results: true
+          },
           orderBy: { requestedAt: "desc" }
         }
       }
@@ -306,8 +309,11 @@ export const getPatientById = async (req: Request, res: Response): Promise<void>
         id: l.id,
         date: l.requestedAt,
         status: l.status,
+        priority: l.priority,
         tests: l.items.map(i => i.LabTest.name),
-        testIds: l.items.map(i => i.labTestId)
+        testIds: l.items.map(i => i.labTestId),
+        reportUrl: l.reportUrl || (l.status === "COMPLETED" ? `/reports/${l.id.slice(0, 8).toUpperCase()}` : null),
+        results: (l as any).results || []
       }));
     
     // Map to the frontend expected format

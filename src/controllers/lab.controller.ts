@@ -96,7 +96,8 @@ export class LabController {
     try {
       const doctorId = req.query.doctorId as string | undefined;
       const type = req.query.type as string | undefined;
-      const requests = await labService.getPendingRequests(doctorId, type);
+      const scope = req.query.scope as string | undefined;
+      const requests = await labService.getPendingRequests(doctorId, type, scope);
       res.json(requests);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -106,7 +107,8 @@ export class LabController {
   async getPublishedReports(req: Request, res: Response) {
     try {
       const doctorId = req.query.doctorId as string | undefined;
-      const reports = await labService.getPublishedReports(doctorId);
+      const scope = req.query.scope as string | undefined;
+      const reports = await labService.getPublishedReports(doctorId, scope);
       res.json(reports);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

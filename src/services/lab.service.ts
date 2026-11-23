@@ -222,12 +222,24 @@ export class LabService {
               { bookingReference: data.visitId }
             ]
           },
-          select: { id: true, doctorId: true }
+          select: { id: true, doctorId: true, bookingReference: true }
         });
         if (apt) {
           effectiveVisitId = apt.id;
           if (!effectiveDoctorId && apt.doctorId) {
             effectiveDoctorId = apt.doctorId;
+          }
+          if (!effectiveDoctorId && apt.bookingReference) {
+            const siblingConsultApt = await prisma.appointment.findFirst({
+              where: {
+                bookingReference: apt.bookingReference,
+                doctorId: { not: null }
+              },
+              select: { doctorId: true }
+            });
+            if (siblingConsultApt?.doctorId) {
+              effectiveDoctorId = siblingConsultApt.doctorId;
+            }
           }
         }
       }
@@ -348,15 +360,26 @@ export class LabService {
   /**
    * Get pending lab requests for the technicians
    */
-  async getPendingRequests(doctorId?: string, type?: string) {
+  async getPendingRequests(doctorId?: string, type?: string, scope?: string) {
     const whereClause: any = {
       status: { in: ["PENDING", "SAVED", "IN_PROGRESS"] }
     };
 
-    if (doctorId) {
+    if (doctorId && scope !== "ALL") {
+      const doctorAppointments = await prisma.appointment.findMany({
+        where: { doctorId },
+        select: { bookingReference: true, patientId: true }
+      });
+      const bookingRefs = doctorAppointments
+        .map(a => a.bookingReference)
+        .filter((ref): ref is string => Boolean(ref));
+      const patientIds = Array.from(new Set(doctorAppointments.map(a => a.patientId).filter(Boolean)));
+
       whereClause.OR = [
         { doctorId },
-        { Visit: { doctorId } }
+        { Visit: { doctorId } },
+        ...(bookingRefs.length > 0 ? [{ Visit: { bookingReference: { in: bookingRefs } } }] : []),
+        ...(patientIds.length > 0 ? [{ patientId: { in: patientIds } }] : [])
       ];
     }
 
@@ -364,8 +387,12 @@ export class LabService {
       whereClause.items = {
         some: { LabTest: { isOutsideTest: true } }
       };
-    } else if (type === "IN_HOUSE" || !type) {
-      // Default for technicians' workbench: only in-house hospital tests
+    } else if (type === "IN_HOUSE") {
+      whereClause.items = {
+        some: { LabTest: { isOutsideTest: false } }
+      };
+    } else if (!type && !doctorId) {
+      // Default for technicians workbench only when doctorId is not specified
       whereClause.items = {
         some: { LabTest: { isOutsideTest: false } }
       };
@@ -396,8 +423,8 @@ export class LabService {
   /**
    * Alias for getPendingRequests to satisfy getLabRequests contract
    */
-  async getLabRequests(doctorId?: string, type?: string) {
-    return this.getPendingRequests(doctorId, type);
+  async getLabRequests(doctorId?: string, type?: string, scope?: string) {
+    return this.getPendingRequests(doctorId, type, scope);
   }
 
   /**
@@ -542,18 +569,30 @@ export class LabService {
   /**
    * Get all completed (published) lab requests
    */
-  async getPublishedReports(doctorId?: string) {
+  async getPublishedReports(doctorId?: string, scope?: string) {
     return withRetry(async () => {
+      const whereCondition: any = { status: "COMPLETED" };
+
+      if (doctorId && scope !== "ALL") {
+        const doctorAppointments = await prisma.appointment.findMany({
+          where: { doctorId },
+          select: { bookingReference: true, patientId: true }
+        });
+        const bookingRefs = doctorAppointments
+          .map(a => a.bookingReference)
+          .filter((ref): ref is string => Boolean(ref));
+        const patientIds = Array.from(new Set(doctorAppointments.map(a => a.patientId).filter(Boolean)));
+
+        whereCondition.OR = [
+          { doctorId },
+          { Visit: { doctorId } },
+          ...(bookingRefs.length > 0 ? [{ Visit: { bookingReference: { in: bookingRefs } } }] : []),
+          ...(patientIds.length > 0 ? [{ patientId: { in: patientIds } }] : [])
+        ];
+      }
+
       const reports = await prisma.labRequest.findMany({
-        where: doctorId
-          ? {
-              status: "COMPLETED",
-              OR: [
-                { doctorId },
-                { Visit: { doctorId } }
-              ]
-            }
-          : { status: "COMPLETED" },
+        where: whereCondition,
         include: {
           items: {
             include: { LabTest: { include: { biomarkers: { orderBy: { orderIndex: 'asc' } }, room: true } } }
@@ -571,6 +610,8 @@ export class LabService {
         if (report.reportUrl && S3Service.isS3Url(report.reportUrl)) {
           const presignedUrl = await S3Service.generateDownloadUrl(report.reportUrl);
           if (presignedUrl) report.reportUrl = presignedUrl;
+        } else if (!report.reportUrl) {
+          report.reportUrl = `/reports/${report.id.slice(0, 8).toUpperCase()}`;
         }
       }
 
