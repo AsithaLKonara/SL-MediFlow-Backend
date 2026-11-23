@@ -277,6 +277,23 @@ export class LabService {
       }
 
       // 1. Create the lab request with items strictly for new (non-duplicate) tests
+      const getTestFinalPrice = (test: any): number => {
+        if (data.customPrices && data.customPrices[test.id] !== undefined) {
+          return Number(data.customPrices[test.id]);
+        }
+        // In the master catalog, test.price is already the full customer selling price
+        // (which for outside tests was saved as: outsourceCost + hospitalCommission).
+        if (test.isOutsideTest) {
+          if (test.price && test.price > (test.outsourceCost || 0)) {
+            return test.price;
+          }
+          // Fallback if price in DB was somehow only the base outsourceCost:
+          return (test.outsourceCost || 0) + (test.hospitalCommission || 0);
+        }
+        return test.price || 0;
+      };
+
+      // 1. Create LabRequest
       const request = await prisma.labRequest.create({
         data: {
           patientId: data.patientId,
@@ -286,14 +303,7 @@ export class LabService {
           status: "PENDING",
           items: {
             create: newTests.map(test => {
-              const basePrice = data.customPrices && data.customPrices[test.id] !== undefined 
-                ? Number(data.customPrices[test.id]) 
-                : test.price;
-              
-              const finalPrice = test.isOutsideTest && (test.hospitalCommission || 0) > 0 && !data.customPrices?.[test.id]
-                ? basePrice + (test.hospitalCommission || 0)
-                : basePrice;
-              
+              const finalPrice = getTestFinalPrice(test);
               if (finalPrice < 0) throw new Error("Price cannot be negative");
               return {
                 labTestId: test.id,
@@ -313,14 +323,7 @@ export class LabService {
           visitId: data.visitId,
           patientId: data.patientId,
           charges: newTests.map(test => {
-            const basePrice = data.customPrices && data.customPrices[test.id] !== undefined
-              ? Number(data.customPrices[test.id])
-              : test.price;
-            
-            const finalPrice = test.isOutsideTest && (test.hospitalCommission || 0) > 0 && !data.customPrices?.[test.id]
-              ? basePrice + (test.hospitalCommission || 0)
-              : basePrice;
-
+            const finalPrice = getTestFinalPrice(test);
             return {
               department: 'LAB',
               referenceId: request.id,
@@ -1121,9 +1124,11 @@ export class LabService {
             ? lt.outsourceCost
             : (it.price || lt.price || 0) * 0.75; // fallback 75% cost if unset
 
-          let hospitalMarkup = lt.hospitalCommission || 0;
-          if (lt.commissionType === "PERCENTAGE" && hospitalMarkup > 0) {
-            hospitalMarkup = (actualCost * hospitalMarkup) / 100;
+          const isPercentage = (lt.commissionType || "").toUpperCase() === "PERCENT" || (lt.commissionType || "").toUpperCase() === "PERCENTAGE";
+          const rawCommRate = lt.hospitalCommission !== null && lt.hospitalCommission !== undefined ? lt.hospitalCommission : 0;
+          let hospitalMarkup = rawCommRate;
+          if (isPercentage && rawCommRate > 0) {
+            hospitalMarkup = Math.round(((actualCost * rawCommRate) / 100) * 100) / 100;
           }
 
           const customerPrice = it.price || lt.price || (actualCost + hospitalMarkup);
@@ -1162,7 +1167,9 @@ export class LabService {
             category: lt.category || "External Pathology",
             outsourcedCenter: centerName,
             outsourceCost: actualCost,
-            commissionType: lt.commissionType || "FLAT",
+            commissionType: isPercentage ? "PERCENTAGE" : "FLAT",
+            commissionRate: rawCommRate,
+            hospitalCommission: hospitalMarkup,
             hospitalMarkup,
             customerPrice,
             profit,
