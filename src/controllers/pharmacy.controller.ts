@@ -99,6 +99,27 @@ export class PharmacyController {
     }
   }
 
+  async repriceBatch(req: Request, res: Response) {
+    try {
+      const { batchId } = req.params;
+      const { unitPrice, reason } = req.body;
+
+      if (!batchId || unitPrice === undefined || Number(unitPrice) < 0) {
+        return res.status(400).json({ error: "batchId and non-negative unitPrice are required." });
+      }
+
+      const result = await pharmacyService.repriceStockBatch(
+        batchId as string,
+        Number(unitPrice),
+        reason as string | undefined
+      );
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   async dispense(req: Request, res: Response) {
     try {
       const { medicineId, quantity, visitId, patientId, description } = req.body;

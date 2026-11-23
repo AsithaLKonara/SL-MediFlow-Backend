@@ -128,6 +128,70 @@ export class PharmacyService {
     return result;
   }
 
+  /**
+   * Forward-only repricing of an existing stock batch.
+   * Prevents corruption of historical sales/dispenses by:
+   * 1. Moving remaining currentQuantity into a newly spawned StockBatch at newPrice.
+   * 2. Marking old batch as SUPERSEDED with currentQuantity=0.
+   */
+  async repriceStockBatch(batchId: string, newPrice: number, reason?: string) {
+    if (newPrice < 0) throw new Error("Price cannot be negative");
+
+    return withRetry(() => prisma.$transaction(async (tx) => {
+      const oldBatch = await tx.stockBatch.findUnique({
+        where: { id: batchId },
+        include: { medicine: true }
+      });
+      if (!oldBatch) throw new Error("Batch not found");
+
+      const remainingQty = oldBatch.currentQuantity;
+      if (remainingQty <= 0) {
+        throw new Error("Cannot reprice a depleted batch with zero quantity");
+      }
+
+      // 1. Create new batch for remaining stock with new price
+      const revisionSuffix = `-R${Date.now().toString().slice(-4)}`;
+      const newBatch = await tx.stockBatch.create({
+        data: {
+          medicineId: oldBatch.medicineId,
+          batchNumber: `${oldBatch.batchNumber}${revisionSuffix}`,
+          expiryDate: oldBatch.expiryDate,
+          initialQuantity: remainingQty,
+          currentQuantity: remainingQty,
+          unitPrice: newPrice,
+          costPrice: oldBatch.costPrice,
+          status: "ACTIVE"
+        }
+      });
+
+      // 2. Mark old batch as SUPERSEDED with zero remaining quantity
+      await tx.stockBatch.update({
+        where: { id: batchId },
+        data: {
+          currentQuantity: 0,
+          status: "SUPERSEDED",
+          supersededById: newBatch.id
+        }
+      });
+
+      // 3. Update medicine retailPrice forward-only
+      await tx.medicine.update({
+        where: { id: oldBatch.medicineId },
+        data: { retailPrice: newPrice }
+      });
+
+      clearCache("pharmacy/medicines").catch(() => {});
+      clearCache("pharmacy/metrics").catch(() => {});
+
+      return {
+        success: true,
+        message: `Forward-only price revision: Created batch ${newBatch.batchNumber} with ${remainingQty} units at LKR ${newPrice.toFixed(2)}. Old batch ${oldBatch.batchNumber} marked SUPERSEDED.`,
+        oldBatchId: oldBatch.id,
+        newBatch
+      };
+    }));
+  }
+
   // --- DISPENSING ENGINE (FIFO LOGIC) ---
   /**
    * Dispense a medicine from stock using FIFO batch ordering.

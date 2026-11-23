@@ -222,6 +222,34 @@ export const updateStaff = async (req: Request, res: Response) => {
     if (commissionRate !== undefined) data.commissionRate = commissionRate !== null ? parseFloat(commissionRate) : 20;
     if (commissionType !== undefined) data.commissionType = commissionType || "PERCENTAGE";
 
+    // Forward-only doctor fee/commission versioning
+    const currentDoc = await prisma.user.findUnique({ where: { id: id as string } });
+    const isFeeChanged = consultationFee !== undefined && currentDoc && (consultationFee ? parseFloat(consultationFee) : null) !== currentDoc.consultationFee;
+    const isCommRateChanged = commissionRate !== undefined && currentDoc && (commissionRate !== null ? parseFloat(commissionRate) : 20) !== currentDoc.commissionRate;
+    const isCommTypeChanged = commissionType !== undefined && currentDoc && (commissionType || "PERCENTAGE") !== currentDoc.commissionType;
+
+    if (currentDoc && (isFeeChanged || isCommRateChanged || isCommTypeChanged)) {
+      await (prisma as any).doctorFeeVersion.updateMany({
+        where: { doctorId: id as string, isActive: true },
+        data: { isActive: false, effectiveTo: new Date() }
+      }).catch(console.error);
+
+      const newFee = consultationFee !== undefined ? (consultationFee ? parseFloat(consultationFee) : 0) : (currentDoc.consultationFee || 0);
+      const newRate = commissionRate !== undefined ? (commissionRate !== null ? parseFloat(commissionRate) : 20) : (currentDoc.commissionRate || 20);
+      const newType = commissionType !== undefined ? (commissionType || "PERCENTAGE") : (currentDoc.commissionType || "PERCENTAGE");
+
+      await (prisma as any).doctorFeeVersion.create({
+        data: {
+          doctorId: id as string,
+          consultationFee: newFee,
+          commissionRate: newRate,
+          commissionType: newType,
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+    }
+
     const updatedStaff = await prisma.user.update({
       where: { id: id as string },
       data,

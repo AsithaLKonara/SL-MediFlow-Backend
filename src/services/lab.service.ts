@@ -47,7 +47,7 @@ export class LabService {
       if (room) targetRoomId = room.id;
     }
 
-    return withRetry(() => prisma.labTest.create({
+    const test = await withRetry(() => prisma.labTest.create({
       data: {
         name: data.name,
         code: data.code,
@@ -67,6 +67,21 @@ export class LabService {
         }
       }
     }));
+
+    // Seed initial forward-only price version
+    await (prisma as any).labTestPriceVersion.create({
+      data: {
+        labTestId: test.id,
+        price: test.price,
+        hospitalCommission: test.hospitalCommission || 0,
+        commissionType: test.commissionType || "FLAT",
+        outsourceCost: test.outsourceCost || 0,
+        effectiveFrom: new Date(),
+        isActive: true,
+      }
+    }).catch(console.error);
+
+    return test;
   }
 
   async updateTestInCatalog(id: string, data: {
@@ -84,6 +99,39 @@ export class LabService {
     outsourcedCenter?: string;
     isActive?: boolean;
   }) {
+    // Audit & version forward-only if financial parameters changed
+    const currentTest = await prisma.labTest.findUnique({ where: { id } });
+    const isPriceChanged = data.price !== undefined && currentTest && data.price !== currentTest.price;
+    const isCommChanged = (data.hospitalCommission !== undefined && currentTest && parseFloat(String(data.hospitalCommission)) !== currentTest.hospitalCommission) ||
+      (data.commissionType !== undefined && currentTest && data.commissionType !== currentTest.commissionType);
+    const isOutsourceCostChanged = data.outsourceCost !== undefined && currentTest && parseFloat(String(data.outsourceCost)) !== currentTest.outsourceCost;
+
+    if (currentTest && (isPriceChanged || isCommChanged || isOutsourceCostChanged)) {
+      // 1. Mark previous active version as superseded
+      await (prisma as any).labTestPriceVersion.updateMany({
+        where: { labTestId: id, isActive: true },
+        data: { isActive: false, effectiveTo: new Date() }
+      }).catch(console.error);
+
+      // 2. Create new forward-only price version record
+      const newPrice = data.price !== undefined ? data.price : currentTest.price;
+      const newComm = data.hospitalCommission !== undefined ? parseFloat(String(data.hospitalCommission)) : (currentTest.hospitalCommission || 0);
+      const newCommType = data.commissionType !== undefined ? data.commissionType : (currentTest.commissionType || "FLAT");
+      const newOutsourceCost = data.outsourceCost !== undefined ? parseFloat(String(data.outsourceCost)) : (currentTest.outsourceCost || 0);
+
+      await (prisma as any).labTestPriceVersion.create({
+        data: {
+          labTestId: id,
+          price: newPrice,
+          hospitalCommission: newComm,
+          commissionType: newCommType,
+          outsourceCost: newOutsourceCost,
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+    }
+
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.code !== undefined) updateData.code = data.code;

@@ -82,6 +82,8 @@ model StockBatch {
   currentQuantity Int
   unitPrice       Float
   costPrice       Float     @default(0)
+  status          String    @default("ACTIVE") // ACTIVE, SUPERSEDED, DEPLETED, WRITTEN_OFF
+  supersededById  String?   // If repriced, points to new batch created from remaining stock
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   medicine        Medicine  @relation(fields: [medicineId], references: [id])
@@ -89,6 +91,7 @@ model StockBatch {
   @@unique([medicineId, batchNumber])
   @@index([expiryDate])
   @@index([medicineId, currentQuantity, expiryDate])
+  @@index([status])
 }
 
 model PurchaseOrder {
@@ -207,8 +210,9 @@ model LabTest {
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  items      LabRequestItem[]
-  biomarkers LabTestBiomarker[]
+  items         LabRequestItem[]
+  biomarkers    LabTestBiomarker[]
+  priceVersions LabTestPriceVersion[]
 }
 
 model LabTestBiomarker {
@@ -490,6 +494,7 @@ model User {
   ExtraServiceOrders     ExtraServiceOrder[]
   ExtraServices          ExtraService[]          @relation("ExtraServiceDoctor")
   expenses               Expense[]
+  feeVersions            DoctorFeeVersion[]
 }
 
 model DoctorSchedule {
@@ -609,6 +614,7 @@ model ExtraService {
   updatedAt              DateTime  @updatedAt
 
   orders                 ExtraServiceOrder[]
+  priceVersions          ExtraServicePriceVersion[]
 }
 
 model ExtraServiceOrder {
@@ -983,3 +989,63 @@ model DoctorDailyPatientItem {
 
   @@index([dailySheetId])
 }
+
+// ─── Forward-Only Price Versioning Models (Milestone 10 / R11) ─────────────
+
+model LabTestPriceVersion {
+  id                 String    @id @default(uuid())
+  labTestId          String
+  price              Float
+  hospitalCommission Float     @default(0)
+  commissionType     String    @default("PERCENTAGE") // PERCENTAGE or FLAT
+  outsourceCost      Float     @default(0)
+  effectiveFrom      DateTime  @default(now())
+  effectiveTo        DateTime?
+  isActive           Boolean   @default(true)
+  createdBy          String?
+  createdAt          DateTime  @default(now())
+
+  labTest            LabTest   @relation(fields: [labTestId], references: [id], onDelete: Cascade)
+
+  @@index([labTestId, effectiveFrom])
+  @@index([isActive])
+}
+
+model ExtraServicePriceVersion {
+  id                     String       @id @default(uuid())
+  serviceId              String
+  price                  Float
+  doctorCommissionRate   Float        @default(0)
+  doctorCommissionType   String       @default("PERCENTAGE") // PERCENTAGE or FLAT
+  hospitalCommissionRate Float        @default(0)
+  hospitalCommissionType String       @default("PERCENTAGE") // PERCENTAGE or FLAT
+  effectiveFrom          DateTime     @default(now())
+  effectiveTo            DateTime?
+  isActive               Boolean      @default(true)
+  createdBy              String?
+  createdAt              DateTime     @default(now())
+
+  service                ExtraService @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, effectiveFrom])
+  @@index([isActive])
+}
+
+model DoctorFeeVersion {
+  id              String    @id @default(uuid())
+  doctorId        String
+  consultationFee Float
+  commissionRate  Float     @default(20)
+  commissionType  String    @default("PERCENTAGE") // PERCENTAGE or FLAT
+  effectiveFrom   DateTime  @default(now())
+  effectiveTo     DateTime?
+  isActive        Boolean   @default(true)
+  createdBy       String?
+  createdAt       DateTime  @default(now())
+
+  doctor          User      @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId, effectiveFrom])
+  @@index([isActive])
+}
+

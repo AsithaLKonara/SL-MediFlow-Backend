@@ -93,6 +93,21 @@ export const extraServiceController = {
           }
         }
       });
+
+      // Seed initial forward-only price version
+      await (prisma as any).extraServicePriceVersion.create({
+        data: {
+          serviceId: service.id,
+          price: service.price,
+          doctorCommissionRate: service.doctorCommissionRate || 0,
+          doctorCommissionType: service.doctorCommissionType || "PERCENTAGE",
+          hospitalCommissionRate: service.hospitalCommissionRate || 0,
+          hospitalCommissionType: service.hospitalCommissionType || "PERCENTAGE",
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+
       await clearCache('*extra-services*');
       res.status(201).json(service);
     } catch (e: any) {
@@ -134,6 +149,40 @@ export const extraServiceController = {
         } else {
           targetRoomId = null;
         }
+      }
+
+      // Audit & version forward-only if financial parameters changed
+      const currentSvc = await prisma.extraService.findUnique({ where: { id } });
+      const isPriceChanged = price !== undefined && currentSvc && parseFloat(price) !== currentSvc.price;
+      const isDocCommChanged = (doctorCommissionRate !== undefined && currentSvc && parseFloat(doctorCommissionRate) !== currentSvc.doctorCommissionRate) ||
+        (doctorCommissionType !== undefined && currentSvc && doctorCommissionType !== currentSvc.doctorCommissionType);
+      const isHospCommChanged = (hospitalCommissionRate !== undefined && currentSvc && parseFloat(hospitalCommissionRate) !== currentSvc.hospitalCommissionRate) ||
+        (hospitalCommissionType !== undefined && currentSvc && hospitalCommissionType !== currentSvc.hospitalCommissionType);
+
+      if (currentSvc && (isPriceChanged || isDocCommChanged || isHospCommChanged)) {
+        await (prisma as any).extraServicePriceVersion.updateMany({
+          where: { serviceId: id, isActive: true },
+          data: { isActive: false, effectiveTo: new Date() }
+        }).catch(console.error);
+
+        const newPrice = price !== undefined ? parseFloat(price) : currentSvc.price;
+        const newDocCommRate = doctorCommissionRate !== undefined ? (parseFloat(doctorCommissionRate) || 0) : (currentSvc.doctorCommissionRate || 0);
+        const newDocCommType = doctorCommissionType !== undefined ? doctorCommissionType : (currentSvc.doctorCommissionType || "PERCENTAGE");
+        const newHospCommRate = hospitalCommissionRate !== undefined ? (parseFloat(hospitalCommissionRate) || 0) : (currentSvc.hospitalCommissionRate || 0);
+        const newHospCommType = hospitalCommissionType !== undefined ? hospitalCommissionType : (currentSvc.hospitalCommissionType || "PERCENTAGE");
+
+        await (prisma as any).extraServicePriceVersion.create({
+          data: {
+            serviceId: id,
+            price: newPrice,
+            doctorCommissionRate: newDocCommRate,
+            doctorCommissionType: newDocCommType,
+            hospitalCommissionRate: newHospCommRate,
+            hospitalCommissionType: newHospCommType,
+            effectiveFrom: new Date(),
+            isActive: true
+          }
+        }).catch(console.error);
       }
 
       const service = await prisma.extraService.update({
