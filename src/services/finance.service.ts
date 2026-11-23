@@ -185,8 +185,8 @@ export class FinanceService {
    * Calculates based on 85% revenue share of the consultation fee.
    */
   async getDoctorSettlements(startDate?: string, endDate?: string) {
-    const start = startDate ? new Date(startDate) : new Date(new Date().setHours(0, 0, 0, 0));
-    const end = endDate ? new Date(endDate) : new Date(new Date().setHours(23, 59, 59, 999));
+    const start = startDate ? getTimezoneBoundaries(startDate).startOfDay : getTimezoneBoundaries().startOfDay;
+    const end = endDate ? getTimezoneBoundaries(endDate).endOfDay : getTimezoneBoundaries().endOfDay;
 
     // 1. Get all COMPLETED appointments in the date range
     const appointments = await prisma.appointment.findMany({
@@ -308,11 +308,9 @@ export class FinanceService {
     if (filters.search) where.description = { contains: filters.search, mode: 'insensitive' };
     if (filters.startDate || filters.endDate) {
       where.date = {};
-      if (filters.startDate) where.date.gte = new Date(filters.startDate);
+      if (filters.startDate) where.date.gte = getTimezoneBoundaries(filters.startDate).startOfDay;
       if (filters.endDate) {
-        const end = new Date(filters.endDate);
-        end.setHours(23, 59, 59, 999);
-        where.date.lte = end;
+        where.date.lte = getTimezoneBoundaries(filters.endDate).endOfDay;
       }
     }
 
@@ -366,8 +364,8 @@ export class FinanceService {
     const dateFilter: Prisma.DateTimeFilter | undefined =
       filters.startDate || filters.endDate
         ? {
-            ...(filters.startDate ? { gte: new Date(filters.startDate) } : {}),
-            ...(filters.endDate ? (() => { const d = new Date(filters.endDate!); d.setHours(23,59,59,999); return { lte: d }; })() : {})
+            ...(filters.startDate ? { gte: getTimezoneBoundaries(filters.startDate).startOfDay } : {}),
+            ...(filters.endDate ? { lte: getTimezoneBoundaries(filters.endDate).endOfDay } : {})
           }
         : undefined;
 

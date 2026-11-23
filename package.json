@@ -5,8 +5,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "tsx src/server.ts",
-    "dev": "tsx watch src/server.ts",
+    "start": "TZ=Asia/Colombo tsx src/server.ts",
+    "dev": "TZ=Asia/Colombo tsx watch src/server.ts",
     "build": "tsc",
     "seed:drugs": "tsx src/scripts/seed-drugs.ts",
     "seed:inventory": "tsx src/scripts/seed-drugs.ts",

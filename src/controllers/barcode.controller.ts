@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { calcDispenseQty } from "./prescription.controller.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export const barcodeController = {
   resolveBarcode: async (req: Request, res: Response) => {
@@ -9,11 +10,7 @@ export const barcodeController = {
       if (!rawCode) return res.status(400).json({ error: "Barcode is required" });
       const code = rawCode.trim();
 
-      const now = new Date();
-      const startOfDay = new Date(now);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(now);
-      endOfDay.setHours(23, 59, 59, 999);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
       const isNumeric10 = /^\d{10}$/.test(code);
       const isShortToken = /^\d{1,3}$/.test(code);
@@ -137,11 +134,7 @@ export const barcodeController = {
                 orderBy: { createdAt: "asc" }
               });
             } else {
-              const apptDate = new Date(appointment.appointmentDate);
-              const apptStart = new Date(apptDate);
-              apptStart.setHours(0, 0, 0, 0);
-              const apptEnd = new Date(apptDate);
-              apptEnd.setHours(23, 59, 59, 999);
+              const { startOfDay: apptStart, endOfDay: apptEnd } = getTimezoneBoundaries(appointment.appointmentDate);
 
               allAppointments = await prisma.appointment.findMany({
                 where: {

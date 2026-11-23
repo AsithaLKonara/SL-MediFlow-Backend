@@ -7,7 +7,7 @@ import { websocketService } from "../services/websocket.service.js";
 import { SMSService } from "../services/sms.service.js";
 import { generateMRN } from "../utils/mrn.util.js";
 import { generateIdentityKey } from "../utils/identity.util.js";
-import { getTimezoneBoundaries } from "../lib/dateUtils.js";
+import { getTimezoneBoundaries, parseAgeString, calculateDobAndFallback, formatPatientAge } from "../lib/dateUtils.js";
 import { sortDoctorsWithOpdFirst, isOpdDoctor } from "../utils/doctor-utils.js";
 import { recordDoctorShareOnPayment } from "./fund-office.controller.js";
 
@@ -61,8 +61,7 @@ export const getCurrentShift = async (req: Request, res: Response) => {
 
     if (roleName === "nurse") {
       // Nurse shifts are strictly linked to daily biometric/attendance clock-in, not cash registers
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay: today } = getTimezoneBoundaries();
 
       const attendance = await prisma.staffAttendance.findUnique({
         where: {
@@ -140,7 +139,11 @@ export const getPatients = async (req: Request, res: Response) => {
         take: 50,
         orderBy: { createdAt: 'desc' }
       });
-      return res.json({ success: true, data: recentPatients });
+      const formatted = recentPatients.map(p => ({
+        ...p,
+        patientAge: formatPatientAge(p.dateOfBirth, p.ageFallback)
+      }));
+      return res.json({ success: true, data: formatted });
     }
     
     const searchTerm = (q as string).trim();
@@ -158,7 +161,11 @@ export const getPatients = async (req: Request, res: Response) => {
       orderBy: { createdAt: 'desc' }
     });
     
-    res.json({ success: true, data: patients });
+    const formatted = patients.map(p => ({
+      ...p,
+      patientAge: formatPatientAge(p.dateOfBirth, p.ageFallback)
+    }));
+    res.json({ success: true, data: formatted });
   } catch (error: any) {
     console.error("Error fetching patients:", error);
     res.status(500).json({ success: false, error: error.message });
@@ -167,11 +174,7 @@ export const getPatients = async (req: Request, res: Response) => {
 
 export const getMetrics = async (req: Request, res: Response) => {
   try {
-    const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     // 1. Registered Today
     const registeredToday = await prisma.patient.count({
@@ -338,6 +341,7 @@ export const generateToken = async (req: Request, res: Response) => {
       patientName, 
       patientPhone, 
       ageFallback, 
+      age,
       doctorId, 
       sessionId: requestedSessionId,
       doctorName, 
@@ -356,17 +360,29 @@ export const generateToken = async (req: Request, res: Response) => {
       roomNumber: requestedRoomNumber 
     } = req.body;
 
+    const rawAgeInput = age !== undefined && age !== null && age !== "" ? age : ageFallback;
+
+    const hasNoPhone = Boolean(req.body.noPhone);
+    const rawPhone = patientPhone ? String(patientPhone).trim() : "";
+    const isSystemGenerated = !rawPhone || 
+      rawPhone.startsWith('WALKIN') || 
+      rawPhone.startsWith('NO-PHONE') || 
+      rawPhone.startsWith('NO_PHONE');
+    const effectivePhone = rawPhone 
+      ? rawPhone 
+      : (hasNoPhone ? `WALKIN-${Date.now().toString().slice(-6)}-${Math.random().toString(36).substring(2, 5).toUpperCase()}` : "");
+
     // Validate mandatory POS patient fields: Name, Phone, Age
     if (!requestedPatientId) {
       if (!patientName || !String(patientName).trim()) {
         return res.status(400).json({ success: false, error: "Patient Name is mandatory for token generation." });
       }
-      if (!patientPhone || !String(patientPhone).trim()) {
+      if (!effectivePhone) {
         return res.status(400).json({ success: false, error: "Patient Phone Number is mandatory for token generation." });
       }
-      const parsedAge = ageFallback !== undefined && ageFallback !== null && ageFallback !== "" ? parseInt(String(ageFallback), 10) : NaN;
-      if (isNaN(parsedAge) || parsedAge <= 0 || parsedAge > 130) {
-        return res.status(400).json({ success: false, error: "Valid Patient Age (1-130) is mandatory for token generation." });
+      const parsedAge = parseAgeString(rawAgeInput);
+      if (!parsedAge.valid) {
+        return res.status(400).json({ success: false, error: parsedAge.error || "Valid Patient Age (1-130) is mandatory for token generation." });
       }
     }
 
@@ -378,16 +394,16 @@ export const generateToken = async (req: Request, res: Response) => {
       patient = await prisma.patient.findUnique({ where: { id: requestedPatientId } });
     }
 
-    // 2. Composite lookup if not explicitly flagged as new patient
-    if (!patient && !isNewPatient && patientName && patientPhone) {
-      const identityKey = generateIdentityKey(patientName, patientPhone);
+    // 2. Composite lookup if not explicitly flagged as new patient and not a systematic fallback code
+    if (!patient && !isNewPatient && !isSystemGenerated && patientName && effectivePhone) {
+      const identityKey = generateIdentityKey(patientName, effectivePhone);
       if (identityKey) {
         patient = await prisma.patient.findUnique({ where: { identityKey } });
       }
       if (!patient) {
         patient = await prisma.patient.findFirst({
           where: {
-            phone: patientPhone,
+            phone: effectivePhone,
             fullName: { equals: patientName, mode: "insensitive" }
           }
         });
@@ -398,8 +414,8 @@ export const generateToken = async (req: Request, res: Response) => {
     if (!patient) {
       const patientId = await generateMRN(prisma);
       const effectiveName = patientName || "Walk-in Patient";
-      const effectivePhone = patientPhone || `WALKIN-${randomUUID()}`;
-      let identityKey = generateIdentityKey(effectiveName, effectivePhone);
+      const finalPhone = effectivePhone || `WALKIN-${randomUUID()}`;
+      let identityKey = isSystemGenerated ? null : generateIdentityKey(effectiveName, finalPhone);
 
       // Handle rare key collision
       if (identityKey) {
@@ -409,19 +425,26 @@ export const generateToken = async (req: Request, res: Response) => {
         }
       }
 
+      const targetDate = date ? new Date(date) : new Date();
+      const parsedAge = parseAgeString(rawAgeInput);
+      const { dob, ageFallback: computedFallback } = parsedAge.valid
+        ? calculateDobAndFallback(parsedAge, targetDate)
+        : { dob: null, ageFallback: ageFallback ? parseInt(ageFallback.toString(), 10) : null };
+
       patient = await prisma.patient.create({
         data: {
           patientId,
           identityKey: identityKey || null,
           fullName: effectiveName,
-          phone: effectivePhone,
-          ageFallback: ageFallback ? parseInt(ageFallback.toString(), 10) : null,
+          phone: finalPhone,
+          dateOfBirth: dob,
+          ageFallback: computedFallback,
           gender: gender || null
         }
       });
       
-      if (patientPhone && !patientPhone.startsWith('WALKIN')) {
-        SMSService.syncContact(patientPhone, patient.fullName).catch(console.error);
+      if (!isSystemGenerated) {
+        SMSService.syncContact(finalPhone, patient.fullName).catch(console.error);
       }
     }
 
@@ -829,9 +852,10 @@ export const generateToken = async (req: Request, res: Response) => {
     const generatedTokens = [];
     for (const t of tokensToGenerate) {
       const token = await generateSpecificToken(t.dept, t.docId, t.roomId, t.prefix, t.requestedTokenNumber);
-      const patientAge = patient?.dateOfBirth 
-        ? (new Date().getFullYear() - new Date(patient.dateOfBirth).getFullYear()) 
-        : (patient?.ageFallback || (ageFallback ? parseInt(ageFallback.toString(), 10) : null));
+      const patientAge = formatPatientAge(
+        patient?.dateOfBirth, 
+        patient?.ageFallback !== null && patient?.ageFallback !== undefined ? patient.ageFallback : (ageFallback ? parseInt(ageFallback.toString(), 10) : null)
+      );
 
       generatedTokens.push({
         id: token.id,
@@ -961,7 +985,12 @@ export const generateToken = async (req: Request, res: Response) => {
       }
     }
 
-    if (patientPhone && !patientPhone.startsWith('WALKIN')) {
+    const isPhoneSystemGenerated = !patientPhone || 
+      patientPhone.startsWith('WALKIN') || 
+      patientPhone.startsWith('NO-PHONE') || 
+      patientPhone.startsWith('NO_PHONE');
+
+    if (patientPhone && !isPhoneSystemGenerated) {
       const isOpd = hasConsultation && doctorDetails && isOpdDoctor(doctorDetails);
 
       if (isOpd) {
@@ -1010,11 +1039,13 @@ export const generateToken = async (req: Request, res: Response) => {
       } catch (e) {}
     }
 
-    if (websocketService.getIo()) {
-      generatedTokens.forEach(t => {
-        websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: t.id });
-      });
-    }
+    try {
+      if (websocketService.getIo()) {
+        generatedTokens.forEach(t => {
+          websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: t.id });
+        });
+      }
+    } catch (e) {}
 
     res.status(201).json({
       success: true,
@@ -1039,17 +1070,13 @@ export const markDoctorArrived = async (req: Request, res: Response) => {
     }
 
     
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
 
     // Find if there's already an attendance record for today
     let attendance = await prisma.doctorAttendance.findFirst({
       where: {
         doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
+        date: { gte: today, lte: endOfDay }
       }
     });
 
@@ -1097,15 +1124,12 @@ export const markDoctorOut = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { outTime } = req.body;
     
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
 
     const attendance = await prisma.doctorAttendance.findFirst({
       where: {
         doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
+        date: { gte: today, lte: endOfDay }
       }
     });
 
@@ -1143,15 +1167,12 @@ export const updateShiftPeriod = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { startTime, endTime } = req.body;
     
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
 
     const attendance = await prisma.doctorAttendance.findFirst({
       where: {
         doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
+        date: { gte: today, lte: endOfDay }
       }
     });
 
@@ -1573,12 +1594,19 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
       );
     }
 
-    if (websocketService.getIo()) {
-      websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: appointmentId });
-    }
+    try {
+      if (websocketService.getIo()) {
+        websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: appointmentId });
+      }
+    } catch (e) {}
 
     // Clinical Rule: OPD doctor sends SMS bills ONLY upon payment/checkout.
-    if (appointment.Patient?.phone && !appointment.Patient.phone.startsWith('WALKIN')) {
+    const isApptPatientSystemPhone = !appointment.Patient?.phone ||
+      appointment.Patient.phone.startsWith('WALKIN') ||
+      appointment.Patient.phone.startsWith('NO-PHONE') ||
+      appointment.Patient.phone.startsWith('NO_PHONE');
+
+    if (appointment.Patient?.phone && !isApptPatientSystemPhone) {
       const isOpd = isOpdDoctor(appointment.User);
       if (isOpd && mergedInvoice && Number(mergedInvoice.totalAmount) > 0) {
         const docName = appointment.User?.fullName || 'OPD Doctor';
@@ -1600,11 +1628,7 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
       include: { Patient: true, User: { include: { room: true } }, room: true }
     });
 
-    const targetDate = new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     allTokens = await Promise.all(allTokens.map(async (t) => {
       let roomNumber = t.room?.roomNumber || t.User?.room?.roomNumber || null;
@@ -1617,9 +1641,7 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
           roomNumber = attendance.room.roomNumber;
         }
       }
-      const patientAge = t.Patient?.dateOfBirth 
-        ? (new Date().getFullYear() - new Date(t.Patient.dateOfBirth).getFullYear()) 
-        : (t.Patient?.ageFallback || null);
+      const patientAge = formatPatientAge(t.Patient?.dateOfBirth, t.Patient?.ageFallback);
 
       return { 
         ...t, 
@@ -1801,9 +1823,7 @@ export const getPOSHistory = async (req: Request, res: Response) => {
             doctorName: matchedAppt.User?.fullName,
             roomNumber: matchedAppt.room?.roomNumber || matchedAppt.User?.room?.roomNumber || null,
             patientName: patient?.fullName || "Walk-in Patient",
-            patientAge: patient?.dateOfBirth 
-              ? (new Date().getFullYear() - new Date(patient.dateOfBirth).getFullYear()) 
-              : (patient?.ageFallback || null),
+            patientAge: formatPatientAge(patient?.dateOfBirth, patient?.ageFallback),
             appointmentDate: matchedAppt.createdAt
           },
           invoice: {

@@ -459,7 +459,11 @@ export class BillingService {
         const patient = await prisma.patient.findUnique({
           where: { id: inv.patientId }
         });
-        if (patient?.phone && !patient.phone.startsWith('WALKIN')) {
+        const isSystemGenerated = !patient?.phone || 
+          patient.phone.startsWith('WALKIN') || 
+          patient.phone.startsWith('NO-PHONE') || 
+          patient.phone.startsWith('NO_PHONE');
+        if (patient?.phone && !isSystemGenerated) {
           const visitRef = inv.visitId;
           const linkedAppt = visitRef ? await prisma.appointment.findFirst({
             where: {

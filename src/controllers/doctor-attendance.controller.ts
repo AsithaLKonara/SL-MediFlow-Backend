@@ -2,15 +2,12 @@ import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { NotificationService } from "../services/notification.service.js";
 import { sortDoctorsWithOpdFirst } from "../utils/doctor-utils.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export const markDoctorArrived = async (req: Request, res: Response) => {
   try {
     const doctorId = req.params.id as string;
-    const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     // 1. Prevent duplicate arrival records - check if already marked today
     const existingAttendance = await prisma.doctorAttendance.findFirst({
@@ -54,11 +51,7 @@ export const markDoctorArrived = async (req: Request, res: Response) => {
 
 export const getDoctorsTodayStatus = async (req: Request, res: Response) => {
   try {
-    const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     const doctors = await prisma.user.findMany({
       where: { Role: { name: { equals: "Doctor", mode: "insensitive" } }, isActive: true },
@@ -101,11 +94,7 @@ export const getDoctorMetrics = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "doctorId is required" });
     }
 
-    const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     const doctor = await prisma.user.findUnique({
       where: { id: doctorId as string }

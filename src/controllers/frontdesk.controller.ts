@@ -17,12 +17,18 @@ export const getDoctorsStatus = async (req: Request, res: Response) => {
 export const updateDoctorAttendance = async (req: Request, res: Response) => {
   try {
     const doctorId = req.params.id as string;
-    const { status, roomId, forceExit, date, startTime, endTime } = req.body;
+    const { status, roomId, forceExit, date, startTime, endTime, ignoreConflict, override } = req.body;
     const userId = (req as any).user?.id;
     
-    const data = await frontdeskService.updateDoctorAttendance(doctorId, status, roomId, userId, forceExit === true, date, startTime, endTime);
+    const data = await frontdeskService.updateDoctorAttendance(
+      doctorId, status, roomId, userId, forceExit === true, date, startTime, endTime,
+      ignoreConflict === true, override === true
+    );
     res.json(data);
   } catch (error: any) {
+    if (error.conflict) {
+      return res.status(409).json(error.conflictData || { conflict: true, error: error.message });
+    }
     res.status(500).json({ error: error.message });
   }
 };
@@ -108,6 +114,9 @@ export const createDoctorSchedule = async (req: Request, res: Response) => {
     const data = await frontdeskService.createDoctorSchedule(doctorId, req.body, userId);
     res.status(201).json(data);
   } catch (error: any) {
+    if (error.conflict) {
+      return res.status(409).json(error.conflictData || { conflict: true, error: error.message });
+    }
     res.status(409).json({ error: error.message }); // 409 Conflict
   }
 };
@@ -119,6 +128,9 @@ export const updateSession = async (req: Request, res: Response) => {
     const data = await frontdeskService.updateSession(sessionId, req.body, userId);
     res.json(data);
   } catch (error: any) {
+    if (error.conflict) {
+      return res.status(409).json(error.conflictData || { conflict: true, error: error.message });
+    }
     res.status(500).json({ error: error.message });
   }
 };

@@ -3,7 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { websocketService } from "../services/websocket.service.js";
 import { billingService } from "../services/billing.service.js";
 import { pharmacyService } from "../services/pharmacy.service.js";
-import { getTimezoneBoundaries } from "../lib/dateUtils.js";
+import { getTimezoneBoundaries, formatPatientAge } from "../lib/dateUtils.js";
 
 // In case of transient NeonDB errors, wrapped execution:
 const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delay = 1000): Promise<T> => {
@@ -511,14 +511,8 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
 
       const doctor = rx.doctorId ? doctorMap.get(rx.doctorId) || null : null;
 
-      let patientAge = "N/A";
-      if (rx.Patient?.dateOfBirth) {
-        const diff = Date.now() - new Date(rx.Patient.dateOfBirth).getTime();
-        const ageDate = new Date(diff);
-        patientAge = Math.abs(ageDate.getUTCFullYear() - 1970).toString();
-      } else if (rx.Patient?.ageFallback) {
-        patientAge = rx.Patient.ageFallback.toString();
-      }
+      const formattedAge = formatPatientAge(rx.Patient?.dateOfBirth, rx.Patient?.ageFallback);
+      let patientAge = formattedAge !== null && formattedAge !== undefined ? formattedAge.toString() : "N/A";
 
       return {
         ...rx,

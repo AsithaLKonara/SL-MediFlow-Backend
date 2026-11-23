@@ -45,6 +45,9 @@ export class NotificationService {
     templateName: string,
     variables: Record<string, string>
   ) {
+    if (!phone || phone.startsWith('WALKIN') || phone.startsWith('NO-PHONE') || phone.startsWith('NO_PHONE')) {
+      return null;
+    }
     return withRetry(async () => {
       let template = await prisma.smsTemplate.findUnique({ where: { name: templateName } });
 
@@ -159,7 +162,7 @@ export class NotificationService {
     totalAmount: string | number;
     billRef: string;
   }) {
-    if (!params.phone || params.phone.startsWith('WALKIN')) return null;
+    if (!params.phone || params.phone.startsWith('WALKIN') || params.phone.startsWith('NO-PHONE') || params.phone.startsWith('NO_PHONE')) return null;
     return this.sendTemplatedSMS(
       params.patientId,
       params.phone,

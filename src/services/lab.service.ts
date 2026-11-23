@@ -320,7 +320,7 @@ export class LabService {
       };
     }
 
-    return withRetry(() => prisma.labRequest.findMany({
+    const requests = await withRetry(() => prisma.labRequest.findMany({
       where: whereClause,
       include: {
         items: {
@@ -333,6 +333,20 @@ export class LabService {
       },
       orderBy: { requestedAt: 'asc' }
     }));
+
+    return requests.map(req => ({
+      ...req,
+      tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+      barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+      patientPhone: req.Patient?.phone || null
+    }));
+  }
+
+  /**
+   * Alias for getPendingRequests to satisfy getLabRequests contract
+   */
+  async getLabRequests(doctorId?: string, type?: string) {
+    return this.getPendingRequests(doctorId, type);
   }
 
   /**
@@ -626,6 +640,9 @@ export class LabService {
         tables: {
           urgentRequests: urgentPending.map(req => ({
             id: req.id,
+            tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+            barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+            patientPhone: req.Patient?.phone || null,
             patientName: req.Patient?.fullName || `Patient ${req.patientId.slice(0, 4)}`,
             doctor: req.Visit?.User?.fullName || "Unknown Doctor",
             tests: req.items.map(i => i.LabTest?.name),
@@ -638,6 +655,9 @@ export class LabService {
             // but if reportUrl is S3 we could transform it. We'll leave metrics raw for speed
             return {
               id: req.id,
+              tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+              barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+              patientPhone: req.Patient?.phone || null,
               patientName: req.Patient?.fullName || `Patient ${req.patientId.slice(0, 4)}`,
               doctor: req.Visit?.User?.fullName || "Unknown Doctor",
               tests: req.items.map(i => i.LabTest?.name),
@@ -648,6 +668,13 @@ export class LabService {
         }
       };
     });
+  }
+
+  /**
+   * Alias for getMetrics to satisfy getLabMetrics contract
+   */
+  async getLabMetrics() {
+    return this.getMetrics();
   }
 
   /**
