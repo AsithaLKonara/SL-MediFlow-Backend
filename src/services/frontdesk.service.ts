@@ -141,7 +141,7 @@ export class FrontdeskService {
           date: { gte: startOfDay, lte: endOfDay },
           roomId: effectiveRoomId,
           doctorId: { not: doctorId },
-          status: { in: ['ARRIVED', 'IN_CONSULTATION'] }
+          status: { in: ['ARRIVED', 'IN_CONSULTATION', 'ON_BREAK'] }
         },
         include: {
           doctor: { select: { id: true, fullName: true } },
@@ -204,21 +204,31 @@ export class FrontdeskService {
         }
 
         if (override) {
-          if (conflictingAttendance) {
+          // Unseat any conflicting attendance records in this room for today
+          const conflictingAttendances = await prisma.doctorAttendance.findMany({
+            where: {
+              date: { gte: startOfDay, lte: endOfDay },
+              roomId: effectiveRoomId,
+              doctorId: { not: doctorId }
+            },
+            include: { doctor: { select: { fullName: true } } }
+          });
+
+          for (const ca of conflictingAttendances) {
             await prisma.doctorAttendance.update({
-              where: { id: conflictingAttendance.id },
+              where: { id: ca.id },
               data: { roomId: null }
             });
-            websocketService.broadcast('DOCTOR_ATTENDANCE_UPDATED', { ...conflictingAttendance, roomId: null });
+            websocketService.broadcast('DOCTOR_ATTENDANCE_UPDATED', { ...ca, roomId: null });
             await prisma.activityLog.create({
               data: {
                 entityType: 'DoctorAttendance',
-                entityId: conflictingAttendance.id,
+                entityId: ca.id,
                 action: 'MARKED_ARRIVED_OVERRIDE',
-                description: `Room ${roomNumber} reassigned to Dr. ${doctorId}. Previous occupant Dr. ${conflictingDoctor?.fullName} unseated from room.`,
+                description: `Room ${roomNumber} reassigned to Dr. ${doctorId}. Previous occupant Dr. ${ca.doctor?.fullName || 'Doctor'} unseated from room.`,
                 userId
               }
-            });
+            }).catch(() => {});
           }
         }
       }
@@ -358,7 +368,7 @@ export class FrontdeskService {
   // 2b. Get Monthly Calendar Aggregation
   async getDoctorCalendar(doctorId: string, month: string) {
     // month format: YYYY-MM
-    const startDate = new Date(`${month}-01T00:00:00.000Z`);
+    const { firstDayOfMonth: startDate } = getTimezoneBoundaries(`${month}-01`);
     const nextMonth = new Date(startDate);
     nextMonth.setMonth(startDate.getMonth() + 1);
 
@@ -1010,6 +1020,23 @@ export class FrontdeskService {
           }
         ).catch(console.error);
       }
+    }
+
+    // Auto-exit active or scheduled attendance for this doctor on the cancelled date
+    const activeAtt = await prisma.doctorAttendance.findFirst({
+      where: {
+        doctorId: session.schedule.doctorId,
+        date: { gte: startOfDay, lte: endOfDay },
+        status: { in: ['ARRIVED', 'IN_CONSULTATION', 'ON_BREAK', 'SCHEDULED'] }
+      }
+    });
+    if (activeAtt) {
+      await prisma.doctorAttendance.update({
+        where: { id: activeAtt.id },
+        data: { status: 'LEFT', leftAt: activeAtt.leftAt || new Date(), roomId: null }
+      });
+      websocketService.broadcast('DOCTOR_ATTENDANCE_UPDATED', { id: activeAtt.id, status: 'LEFT', roomId: null });
+      websocketService.broadcast('ROOM_STATUS_UPDATED', { type: 'SESSION_CANCELLED', roomId: activeAtt.roomId });
     }
 
     await prisma.activityLog.create({

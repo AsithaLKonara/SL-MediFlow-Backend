@@ -471,22 +471,18 @@ export const getRoomSchedules = async (req: Request, res: Response) => {
       const daySessions = sessions.filter(s => s.dayOfWeek === dayIndex);
       
       for (const s of daySessions) {
-         const validFrom = new Date(s.schedule.validFrom);
-         validFrom.setHours(0, 0, 0, 0);
+         const { startOfDay: validFrom } = getTimezoneBoundaries(s.schedule.validFrom);
          if (currentDate < validFrom) continue;
          
          if (s.schedule.validUntil) {
-            const validUntil = new Date(s.schedule.validUntil);
-            validUntil.setHours(23, 59, 59, 999);
+            const { endOfDay: validUntil } = getTimezoneBoundaries(s.schedule.validUntil);
             if (currentDate > validUntil) continue;
          }
 
          // Check leave
          const onLeave = s.schedule.leaves?.some(l => {
-           const lStart = new Date(l.startDate);
-           lStart.setHours(0, 0, 0, 0);
-           const lEnd = new Date(l.endDate);
-           lEnd.setHours(23, 59, 59, 999);
+           const { startOfDay: lStart } = getTimezoneBoundaries(l.startDate);
+           const { endOfDay: lEnd } = getTimezoneBoundaries(l.endDate);
            return currentDate >= lStart && currentDate <= lEnd;
          });
          if (onLeave) continue;

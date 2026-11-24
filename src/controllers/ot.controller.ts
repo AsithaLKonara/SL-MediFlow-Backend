@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 // Helper: Calculate OT hours handling overnight shifts
 export function calculateOTHours(start: Date, end: Date): number {
@@ -23,11 +24,9 @@ export const getOvertimeRecords = async (req: Request, res: Response) => {
     if (shiftType) where.shiftType = String(shiftType);
     if (startDate || endDate) {
       where.date = {};
-      if (startDate) where.date.gte = new Date(String(startDate));
+      if (startDate) where.date.gte = getTimezoneBoundaries(String(startDate)).startOfDay;
       if (endDate) {
-        const eDate = new Date(String(endDate));
-        eDate.setHours(23, 59, 59, 999);
-        where.date.lte = eDate;
+        where.date.lte = getTimezoneBoundaries(String(endDate)).endOfDay;
       }
     }
     if (departmentId) {

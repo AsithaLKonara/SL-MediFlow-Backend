@@ -166,8 +166,11 @@ export const getPrescriptionById = async (req: Request, res: Response) => {
         medicine: i.medicine ? {
           id: i.medicine.id,
           name: i.medicine.name,
+          form: i.medicine.form || null,
+          strength: i.medicine.strength || null,
           unit: i.medicine.unit,
           packSize: i.medicine.packSize ?? 1,
+          retailPrice: i.medicine.retailPrice ?? 0,
           stockBatches: i.medicine.stockBatches
         } : null
       })),
@@ -514,7 +517,7 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
           const dispenseQty = calcDispenseQty(i);
           const batches = i.medicine?.stockBatches || [];
           const totalStock = batches.reduce((sum: number, b: any) => sum + (b.currentQuantity || 0), 0);
-          const unitPrice = batches[0]?.unitPrice ?? 0;
+          const unitPrice = batches[0]?.unitPrice ?? i.medicine?.retailPrice ?? 0;
           return {
             ...i,
             dispenseQty,
@@ -522,7 +525,8 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
             unitPrice,
             medicine: i.medicine ? {
               ...i.medicine,
-              packSize: i.medicine.packSize ?? 1
+              packSize: i.medicine.packSize ?? 1,
+              retailPrice: i.medicine.retailPrice ?? 0
             } : null
           };
         }),
@@ -906,7 +910,7 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
                   include: {
                     stockBatches: {
                       where: { currentQuantity: { gt: 0 } },
-                      orderBy: { createdAt: 'asc' as const },
+                      orderBy: { expiryDate: 'asc' as const },
                       take: 1,
                     }
                   }
@@ -1133,7 +1137,7 @@ export const addItemToPrescription = async (req: Request, res: Response): Promis
           include: {
             stockBatches: {
               where: { currentQuantity: { gt: 0 } },
-              orderBy: { createdAt: "asc" }
+              orderBy: { expiryDate: "asc" }
             }
           }
         }
@@ -1190,7 +1194,7 @@ export const updatePrescriptionItem = async (req: Request, res: Response): Promi
           include: {
             stockBatches: {
               where: { currentQuantity: { gt: 0 } },
-              orderBy: { createdAt: "asc" }
+              orderBy: { expiryDate: "asc" }
             }
           }
         }

@@ -3,7 +3,10 @@ import { getTimezoneBoundaries, getColomboDayOfWeek } from "../lib/dateUtils.js"
 import { autoExitPastDoctors, expirePastTokens, expirePastPrescriptions } from "../services/token-lifecycle.service.js";
 import { pharmacyService } from "../services/pharmacy.service.js";
 import { calcDispenseQty } from "../controllers/prescription.controller.js";
+import { FrontdeskService } from "../services/frontdesk.service.js";
 import { prisma } from "../lib/prisma.js";
+
+const frontdeskService = new FrontdeskService();
 
 async function runAuditVerificationSuite() {
   console.log("======================================================================");
@@ -101,6 +104,72 @@ async function runAuditVerificationSuite() {
       await prisma.doctorAttendance.delete({ where: { id: pastAttendance.id } }).catch(() => {});
       console.log("✔ PASS: Day-end doctor auto-exit successfully transitions stranded doctors to LEFT.\n");
       passedTests++;
+
+      // 2. Verify Doctor Arrival Overlap & Override
+      let testRoom = await prisma.room.findFirst({ where: { isActive: true } });
+      let secondDoc = await prisma.user.findFirst({
+        where: { Role: { name: "Doctor" }, isActive: true, id: { not: testDoc.id } }
+      });
+      if (testRoom && secondDoc) {
+        const { startOfDay: todayStart } = getTimezoneBoundaries();
+        // Doc 1 arrives in testRoom
+        const att1 = await prisma.doctorAttendance.create({
+          data: {
+            doctorId: testDoc.id,
+            date: todayStart,
+            status: "ARRIVED",
+            roomId: testRoom.id,
+            arrivedAt: new Date()
+          }
+        });
+
+        // Doc 2 attempts to arrive in testRoom without override -> must throw conflict
+        let conflictCaught = false;
+        try {
+          await frontdeskService.updateDoctorAttendance(
+            secondDoc.id,
+            "ARRIVED",
+            testRoom.id,
+            secondDoc.id,
+            false,
+            undefined,
+            undefined,
+            undefined,
+            false, // ignoreConflict
+            false  // override
+          );
+        } catch (err: any) {
+          if (err.conflict) conflictCaught = true;
+        }
+        assert.equal(conflictCaught, true, "Arriving in an occupied room must throw a conflict error");
+
+        // Doc 2 arrives with override: true -> must unseat Doc 1
+        await frontdeskService.updateDoctorAttendance(
+          secondDoc.id,
+          "ARRIVED",
+          testRoom.id,
+          secondDoc.id,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          true // override
+        );
+
+        const updatedAtt1 = await prisma.doctorAttendance.findUnique({ where: { id: att1.id } });
+        assert.equal(updatedAtt1?.roomId, null, "Overriding doctor arrival must unseat previous occupant's roomId to null");
+
+        // Clean up
+        await prisma.doctorAttendance.deleteMany({
+          where: { id: att1.id }
+        }).catch(() => {});
+        await prisma.doctorAttendance.deleteMany({
+          where: { doctorId: secondDoc.id, date: { gte: todayStart } }
+        }).catch(() => {});
+        console.log("✔ PASS: Doctor arrival overlap detected and override unseats previous occupant.\n");
+        passedTests++;
+      }
     } else {
       console.log("⚠ SKIP (no doctor found in test DB): Day-end auto-exit verified via unit logic.\n");
     }

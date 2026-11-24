@@ -135,7 +135,7 @@ export class PharmacyController {
 
       const effectiveDispensedMl = dispensedMl !== undefined
         ? Number(dispensedMl)
-        : (isSyrup && syrupVolumeMl !== undefined ? Number(syrupVolumeMl) : undefined);
+        : (isSyrup ? Number(syrupVolumeMl || quantity) : undefined);
 
       const result = await pharmacyService.dispenseMedicine(
         medicineId, 
@@ -214,8 +214,19 @@ export class PharmacyController {
 
         for (const item of items) {
           const qty = Number(item.qty);
-          // For syrups the POS sends isSyrup=true + syrupVolumeMl; convert ml → bottles for stock deduction
-          const dispensedMl = item.isSyrup && item.syrupVolumeMl ? Number(item.syrupVolumeMl) : undefined;
+          let isSyrup = item.isSyrup;
+          if (isSyrup === undefined) {
+            const medRecord = await tx.medicine.findUnique({
+              where: { id: item.id },
+              select: { form: true, unit: true, packSize: true }
+            });
+            isSyrup = medRecord && (
+              ['syrup', 'suspension', 'liquid'].includes(medRecord.form?.trim().toLowerCase() || '') ||
+              (medRecord.unit?.trim().toLowerCase() === 'bottle' && (medRecord.packSize || 1) > 1)
+            );
+          }
+          // For syrups the POS sends isSyrup=true + syrupVolumeMl (or qty in ml); convert ml → bottles for stock deduction
+          const dispensedMl = isSyrup && (item.syrupVolumeMl || item.qty) ? Number(item.syrupVolumeMl || item.qty) : undefined;
 
           // Delegate to pharmacyService to ensure row-level locks and FIFO logic are applied securely
           const dispenseResult = await pharmacyService.dispenseMedicine(

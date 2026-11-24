@@ -12,6 +12,9 @@ import { sortDoctorsWithOpdFirst, isOpdDoctor } from "../utils/doctor-utils.js";
 import { recordDoctorShareOnPayment } from "./fund-office.controller.js";
 import { pharmacyService } from "../services/pharmacy.service.js";
 import { clearCache } from "../middlewares/cache.middleware.js";
+import { FrontdeskService } from "../services/frontdesk.service.js";
+
+const frontdeskService = new FrontdeskService();
 
 export const openShift = async (req: Request, res: Response) => {
   try {
@@ -1071,57 +1074,31 @@ export const generateToken = async (req: Request, res: Response) => {
 export const markDoctorArrived = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { roomId, startTime, endTime } = req.body;
+    const { roomId, startTime, endTime, ignoreConflict, override } = req.body;
 
     if (!roomId || roomId.trim() === "") {
       return res.status(400).json({ success: false, error: "Room is mandatory" });
     }
 
-    
-    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
+    const userId = (req as any).user?.id || (id as string);
+    const data = await frontdeskService.updateDoctorAttendance(
+      id as string,
+      "ARRIVED",
+      roomId,
+      userId,
+      false,
+      undefined,
+      startTime,
+      endTime,
+      ignoreConflict === true,
+      override === true
+    );
 
-    // Find if there's already an attendance record for today
-    let attendance = await prisma.doctorAttendance.findFirst({
-      where: {
-        doctorId: id as string,
-        date: { gte: today, lte: endOfDay }
-      }
-    });
-
-    if (attendance) {
-      attendance = await prisma.doctorAttendance.update({
-        where: { id: attendance.id },
-        data: {
-          status: "ARRIVED",
-          roomId: roomId || null,
-          arrivedAt: attendance.arrivedAt || new Date(),
-          expectedStartTime: startTime || attendance.expectedStartTime,
-          expectedEndTime: endTime || attendance.expectedEndTime
-        }
-      });
-    } else {
-      attendance = await prisma.doctorAttendance.create({
-        data: {
-          doctorId: id as string,
-          date: today,
-          status: "ARRIVED",
-          roomId: roomId || null,
-          arrivedAt: new Date(),
-          expectedStartTime: startTime || null,
-          expectedEndTime: endTime || null
-        }
-      });
-    }
-    
-    // Trigger SMS to waiting patients
-    try {
-      await NotificationService.triggerDoctorArrived(id as string, today);
-    } catch (e) {
-      console.error("Failed to send doctor arrived SMS notifications:", e);
-    }
-    
-    res.json({ success: true, data: attendance });
+    res.json({ success: true, data });
   } catch (error: any) {
+    if (error.conflict) {
+      return res.status(409).json(error.conflictData || { conflict: true, error: error.message });
+    }
     console.error("Error marking doctor arrived:", error);
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1130,38 +1107,18 @@ export const markDoctorArrived = async (req: Request, res: Response) => {
 export const markDoctorOut = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { outTime } = req.body;
-    
-    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
+    const { forceExit } = req.body;
+    const userId = (req as any).user?.id || (id as string);
 
-    const attendance = await prisma.doctorAttendance.findFirst({
-      where: {
-        doctorId: id as string,
-        date: { gte: today, lte: endOfDay }
-      }
-    });
+    const data = await frontdeskService.updateDoctorAttendance(
+      id as string,
+      "LEFT",
+      null,
+      userId,
+      forceExit === true
+    );
 
-    if (!attendance) {
-      return res.status(404).json({ success: false, error: "No arrival record found for today" });
-    }
-
-    let leftAt = new Date();
-    if (outTime) {
-      // outTime is expected to be "HH:MM"
-      const [hours, minutes] = outTime.split(':');
-      leftAt = new Date();
-      leftAt.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0);
-    }
-
-    const updated = await prisma.doctorAttendance.update({
-      where: { id: attendance.id },
-      data: {
-        status: "LEFT",
-        leftAt
-      }
-    });
-    
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data });
   } catch (error: any) {
     console.error("Error marking doctor out:", error);
     res.status(500).json({ success: false, error: error.message });
@@ -1894,7 +1851,18 @@ export const posDirectSale = async (req: Request, res: Response) => {
       for (const med of medicineItems) {
         if (med.id) {
           try {
-            const dispensedMl = med.isSyrup && (med.syrupVolumeMl || med.qty) ? Number(med.syrupVolumeMl || med.qty) : undefined;
+            let isSyrup = med.isSyrup;
+            if (isSyrup === undefined) {
+              const medRecord = await tx.medicine.findUnique({
+                where: { id: med.id },
+                select: { form: true, unit: true, packSize: true }
+              });
+              isSyrup = medRecord && (
+                ['syrup', 'suspension', 'liquid'].includes(medRecord.form?.trim().toLowerCase() || '') ||
+                (medRecord.unit?.trim().toLowerCase() === 'bottle' && (medRecord.packSize || 1) > 1)
+              );
+            }
+            const dispensedMl = isSyrup && (med.syrupVolumeMl || med.qty) ? Number(med.syrupVolumeMl || med.qty) : undefined;
             await pharmacyService.dispenseMedicine(
               med.id,
               Number(med.qty) || 1,
@@ -1918,10 +1886,14 @@ export const posDirectSale = async (req: Request, res: Response) => {
           desc = `Lab Test: ${desc}`;
         } else if (item.department === "EXTRA_SERVICE" && !desc.toLowerCase().includes("service")) {
           desc = `Service: ${desc}`;
+        } else if (item.isSyrup && item.syrupVolumeMl) {
+          desc = `${item.name} - ${item.syrupVolumeMl} ml @ LKR ${unitPrice.toFixed(2)}/ml`;
         }
 
+        const dept = item.department || (item.isMedicine ? "PHARMACY" : "EXTRA_SERVICE");
+
         return {
-          department: item.department || "EXTRA_SERVICE",
+          department: dept,
           referenceId: item.id || undefined,
           description: desc,
           quantity: qty,

@@ -355,12 +355,10 @@ export const extraServiceOrderController = {
       if (startDate || endDate) {
         where.createdAt = {};
         if (startDate) {
-          where.createdAt.gte = new Date(String(startDate));
+          where.createdAt.gte = getTimezoneBoundaries(String(startDate)).startOfDay;
         }
         if (endDate) {
-          const end = new Date(String(endDate));
-          end.setHours(23, 59, 59, 999);
-          where.createdAt.lte = end;
+          where.createdAt.lte = getTimezoneBoundaries(String(endDate)).endOfDay;
         }
       }
 
