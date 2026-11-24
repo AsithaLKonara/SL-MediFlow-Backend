@@ -1,6 +1,7 @@
 import { prisma, withRetry } from "../lib/prisma.js";
 import { SMSService } from "./sms.service.js";
 import { isOpdDoctor } from "../utils/doctor-utils.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export class NotificationService {
   static initSweeper() {
@@ -179,10 +180,7 @@ export class NotificationService {
 
   static async triggerDoctorArrived(doctorId: string, sessionDate: Date, roomNumberParam?: string) {
     return withRetry(async () => {
-      const startOfDay = new Date(sessionDate);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(sessionDate);
-      endOfDay.setHours(23, 59, 59, 999);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries(sessionDate);
 
       // Fetch doctor details and room
       const doctor = await prisma.user.findUnique({

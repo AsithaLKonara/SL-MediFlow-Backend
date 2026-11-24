@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 /**
  * @deprecated Legacy doctor settlement mechanism. Standardize on Fund Office DoctorDailySheet.
@@ -56,10 +57,8 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "periodStart and periodEnd are required" });
     }
 
-    const start = new Date(periodStart);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(periodEnd);
-    end.setHours(23, 59, 59, 999);
+    const start = getTimezoneBoundaries(periodStart as string).startOfDay;
+    const end = getTimezoneBoundaries(periodEnd as string).endOfDay;
 
     // 1. Find doctors (either specific or all active doctors with specialties)
     const doctorWhere: any = { isActive: true };

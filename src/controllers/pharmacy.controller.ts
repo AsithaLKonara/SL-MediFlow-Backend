@@ -122,7 +122,7 @@ export class PharmacyController {
 
   async dispense(req: Request, res: Response) {
     try {
-      const { medicineId, quantity, visitId, patientId, description } = req.body;
+      const { medicineId, quantity, visitId, patientId, description, isSyrup, syrupVolumeMl, dispensedMl } = req.body;
       
       if (!medicineId || quantity === undefined) {
         return res.status(400).json({ error: "Missing medicineId or quantity" });
@@ -133,6 +133,10 @@ export class PharmacyController {
         return res.status(400).json({ error: "Quantity must be a positive number" });
       }
 
+      const effectiveDispensedMl = dispensedMl !== undefined
+        ? Number(dispensedMl)
+        : (isSyrup && syrupVolumeMl !== undefined ? Number(syrupVolumeMl) : undefined);
+
       const result = await pharmacyService.dispenseMedicine(
         medicineId, 
         qty,
@@ -140,7 +144,9 @@ export class PharmacyController {
           visitId,
           patientId,
           description
-        }
+        },
+        undefined,
+        effectiveDispensedMl
       );
       
       res.json(result);

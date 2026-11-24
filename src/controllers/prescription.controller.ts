@@ -104,7 +104,13 @@ export const getPrescriptionById = async (req: Request, res: Response) => {
         items: {
           include: {
             medicine: {
-              include: { stockBatches: { orderBy: { expiryDate: 'asc' }, take: 1 } }
+              include: {
+                stockBatches: {
+                  where: { currentQuantity: { gt: 0 } },
+                  orderBy: { expiryDate: 'asc' },
+                  take: 1
+                }
+              }
             }
           }
         }
@@ -574,20 +580,31 @@ export const markPrescriptionDispensed = async (req: Request, res: Response): Pr
             });
 
             if (rxItem?.medicineId && di.dispenseQty > 0) {
+              const med = rxItem.medicine;
+              const isSyrup = (rxItem.doseUnit?.trim().toLowerCase() === "ml") ||
+                ["syrup", "suspension", "liquid"].includes(med?.form?.trim().toLowerCase() || "") ||
+                (med?.unit?.trim().toLowerCase() === "bottle" && (med?.packSize || 1) > 1);
+
+              const dispensedMl = isSyrup ? di.dispenseQty : undefined;
+
               // Delegate to pharmacyService for secure, locked FIFO deduction
               const dispenseResult = await pharmacyService.dispenseMedicine(
                 rxItem.medicineId,
                 di.dispenseQty,
                 { skipBilling: true },
-                tx
+                tx,
+                dispensedMl
               );
 
               totalPharmacyCost += dispenseResult.totalCost;
-              const actualDispensed = dispenseResult.batchesUsed.reduce((sum: number, b: any) => sum + b.quantityDispensed, 0);
+              // For syrups, preserve prescribed ml in dispenseQty; for solids, record units dispensed
+              const recordedQty = isSyrup
+                ? di.dispenseQty
+                : dispenseResult.batchesUsed.reduce((sum: number, b: any) => sum + b.quantityDispensed, 0);
               
               await tx.prescriptionItem.update({
                 where: { id: di.itemId },
-                data: { dispenseQty: actualDispensed }
+                data: { dispenseQty: recordedQty }
               });
             } else if (rxItem) {
               await tx.prescriptionItem.update({

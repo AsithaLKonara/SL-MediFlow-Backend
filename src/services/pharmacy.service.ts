@@ -1,6 +1,7 @@
 import { prisma, withRetry } from "../lib/prisma.js";
 import { BillingService } from "./billing.service.js";
 import { clearCache } from "../middlewares/cache.middleware.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 const billingService = new BillingService();
 
@@ -116,12 +117,21 @@ export class PharmacyService {
 
   // --- INVENTORY MANAGEMENT ---
   async addStockBatch(data: { medicineId: string; batchNumber: string; expiryDate?: Date; initialQuantity: number; unitPrice: number }) {
-    const result = await withRetry(() => prisma.stockBatch.create({
-      data: {
-        ...data,
-        expiryDate: data.expiryDate || null,
-        currentQuantity: data.initialQuantity,
-      },
+    const result = await withRetry(() => prisma.$transaction(async (tx) => {
+      const batch = await tx.stockBatch.create({
+        data: {
+          ...data,
+          expiryDate: data.expiryDate || null,
+          currentQuantity: data.initialQuantity,
+          status: "ACTIVE"
+        },
+      });
+      // Forward-only sync of medicine retailPrice to the latest added batch price
+      await tx.medicine.update({
+        where: { id: data.medicineId },
+        data: { retailPrice: data.unitPrice }
+      });
+      return batch;
     }));
     clearCache("pharmacy/medicines").catch(() => {});
     clearCache("pharmacy/metrics").catch(() => {});
@@ -421,8 +431,7 @@ export class PharmacyService {
 
   async getMetrics() {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay } = getTimezoneBoundaries();
 
       const pendingPrescriptions = await prisma.prescription.count({
         where: { status: "PENDING" }
@@ -431,7 +440,7 @@ export class PharmacyService {
       const fulfilledToday = await prisma.prescription.count({
         where: {
           status: "DISPENSED",
-          updatedAt: { gte: today }
+          updatedAt: { gte: startOfDay }
         }
       });
 
@@ -466,7 +475,7 @@ export class PharmacyService {
       }));
 
       const pharmacyLines = await prisma.invoiceLineItem.findMany({
-        where: { department: "PHARMACY", createdAt: { gte: today } }
+        where: { department: "PHARMACY", createdAt: { gte: startOfDay } }
       });
       const totalRevenue = pharmacyLines.reduce((sum: number, item: any) => sum + item.total, 0);
 

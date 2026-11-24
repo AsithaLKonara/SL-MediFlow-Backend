@@ -425,10 +425,8 @@ export const getRoomSchedules = async (req: Request, res: Response) => {
     const startStr = (startDate as string).includes('T') ? (startDate as string).split('T')[0] : (startDate as string);
     const endStr = (endDate as string).includes('T') ? (endDate as string).split('T')[0] : (endDate as string);
 
-    const start = new Date(`${startStr}T00:00:00`);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(`${endStr}T00:00:00`);
-    end.setHours(23, 59, 59, 999);
+    const start = getTimezoneBoundaries(startStr).startOfDay;
+    const end = getTimezoneBoundaries(endStr).endOfDay;
 
     const room = await prisma.room.findUnique({ where: { id: roomId } });
     if (!room) return res.status(404).json({ success: false, error: "Room not found" });

@@ -195,6 +195,8 @@ export const barcodeController = {
                         strength: true,
                         packSize: true,
                         stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' },
                           select: { unitPrice: true, currentQuantity: true },
                           take: 1
                         }
@@ -408,11 +410,37 @@ export const barcodeController = {
         const prescription = isUUID || code.length === 36
           ? await prisma.prescription.findUnique({
               where: { id: code },
-              include: { items: { include: { medicine: { include: { stockBatches: true } } } } }
+              include: {
+                items: {
+                  include: {
+                    medicine: {
+                      include: {
+                        stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             })
           : await prisma.prescription.findFirst({
               where: { id: { startsWith: code } },
-              include: { items: { include: { medicine: { include: { stockBatches: true } } } } }
+              include: {
+                items: {
+                  include: {
+                    medicine: {
+                      include: {
+                        stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             });
 
         if (prescription) {
@@ -469,7 +497,12 @@ export const barcodeController = {
             { name: code }
           ]
         },
-        include: { stockBatches: true }
+        include: {
+          stockBatches: {
+            where: { currentQuantity: { gt: 0 } },
+            orderBy: { expiryDate: 'asc' }
+          }
+        }
       });
       if (medicine) {
         return res.json({ type: "MEDICINE", data: medicine });

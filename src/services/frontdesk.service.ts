@@ -290,14 +290,16 @@ export class FrontdeskService {
       }
     }
 
+    const isDoctorExited = status === 'COMPLETED' || status === 'LEFT';
+
     if (attendance) {
       attendance = await prisma.doctorAttendance.update({
         where: { id: attendance.id },
         data: { 
           status, 
-          roomId: effectiveRoomId || attendance.roomId,
+          roomId: isDoctorExited ? null : (effectiveRoomId || attendance.roomId),
           arrivedAt: status === 'ARRIVED' && !attendance.arrivedAt ? new Date() : attendance.arrivedAt,
-          leftAt: status === 'COMPLETED' ? new Date() : attendance.leftAt,
+          leftAt: isDoctorExited ? (attendance.leftAt || new Date()) : attendance.leftAt,
           expectedStartTime: startTime || attendance.expectedStartTime,
           expectedEndTime: endTime || attendance.expectedEndTime
         }
@@ -307,9 +309,10 @@ export class FrontdeskService {
         data: {
           doctorId,
           status,
-          roomId: effectiveRoomId,
+          roomId: isDoctorExited ? null : effectiveRoomId,
           date: targetDate,
           arrivedAt: status === 'ARRIVED' ? new Date() : null,
+          leftAt: isDoctorExited ? new Date() : null,
           expectedStartTime: startTime || null,
           expectedEndTime: endTime || null
         }

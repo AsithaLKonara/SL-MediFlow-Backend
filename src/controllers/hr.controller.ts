@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { websocketService } from "../services/websocket.service.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 import {
   generatePayrollSchema,
   applyLeaveSchema,
@@ -15,8 +16,7 @@ export const clockIn = async (req: Request, res: Response) => {
     const { userId } = req.body; // or req.user.id if using auth middleware
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { startOfDay: today } = getTimezoneBoundaries();
 
     let attendance = await prisma.staffAttendance.findUnique({
       where: {
@@ -51,8 +51,7 @@ export const clockOut = async (req: Request, res: Response) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { startOfDay: today } = getTimezoneBoundaries();
 
     const attendance = await prisma.staffAttendance.findUnique({
       where: {

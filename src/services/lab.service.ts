@@ -624,11 +624,10 @@ export class LabService {
    */
     async getMetrics() {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const yesterday = new Date(today);
-      yesterday.setDate(yesterday.getDate() - 1);
+      const { startOfDay: today } = getTimezoneBoundaries();
+      const yesterdayDate = new Date();
+      yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+      const { startOfDay: yesterday } = getTimezoneBoundaries(yesterdayDate);
 
       // Pending (currently waiting)
       const pendingCount = await prisma.labRequest.count({
@@ -850,8 +849,7 @@ export class LabService {
    */
   async getRequestByToken(tokenOrBarcode: string) {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay: today } = getTimezoneBoundaries();
       const code = (tokenOrBarcode || "").trim();
 
       if (!code) {

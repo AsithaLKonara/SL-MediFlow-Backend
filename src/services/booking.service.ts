@@ -10,11 +10,7 @@ import { sortDoctorsWithOpdFirst, isOpdDoctor } from "../utils/doctor-utils.js";
 export class BookingService {
   static async getDoctors() {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
       const doctors = await prisma.user.findMany({
         where: { Role: { name: "Doctor" }, isActive: true },
@@ -28,7 +24,7 @@ export class BookingService {
           DoctorAttendance: {
             include: { room: true },
             where: {
-              date: { gte: today, lt: tomorrow },
+              date: { gte: startOfDay, lte: endOfDay },
               status: { in: ["ARRIVED", "LEFT"] }
             },
             take: 1

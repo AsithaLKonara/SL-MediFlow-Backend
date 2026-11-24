@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { SMSService } from "../services/sms.service.js";
 import { NotificationService } from "../services/notification.service.js";
 import { S3Service } from "../services/s3.service.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -194,10 +195,7 @@ export const getPatientHistory = async (req: Request, res: Response) => {
 
     // 3. Time boundaries for today's active visits
     const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries(today);
 
     // 4. Fetch all family members sharing this contact phone
     const familyPatients = await prisma.patient.findMany({

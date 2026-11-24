@@ -1894,11 +1894,13 @@ export const posDirectSale = async (req: Request, res: Response) => {
       for (const med of medicineItems) {
         if (med.id) {
           try {
+            const dispensedMl = med.isSyrup && (med.syrupVolumeMl || med.qty) ? Number(med.syrupVolumeMl || med.qty) : undefined;
             await pharmacyService.dispenseMedicine(
               med.id,
               Number(med.qty) || 1,
               { skipBilling: true },
-              tx
+              tx,
+              dispensedMl
             );
           } catch (err: any) {
             console.warn(`[posDirectSale] Dispense notice for medicine ${med.id}:`, err.message);
