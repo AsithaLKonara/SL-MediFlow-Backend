@@ -1076,8 +1076,7 @@ export class LabService {
    */
   async getOutsourceDailyReports(dateStr?: string, centerFilter?: string, searchStr?: string) {
     return withRetry(async () => {
-      const targetDate = dateStr ? new Date(dateStr) : undefined;
-      const { startOfDay, endOfDay } = getTimezoneBoundaries(targetDate);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries(dateStr || undefined);
       const cleanSearch = (searchStr || "").trim();
 
       // Base date condition (today / selected date)
