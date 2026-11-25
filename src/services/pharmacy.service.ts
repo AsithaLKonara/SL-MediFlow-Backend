@@ -222,16 +222,24 @@ export class PharmacyService {
       // Lock all batches for this medicine to serialize concurrent dispensing
       await tx.$executeRaw`SELECT id FROM "StockBatch" WHERE "medicineId" = ${medicineId} FOR UPDATE`;
 
-      // --- Syrup/liquid path: resolve packSize for ml→bottle conversion ---
+      // --- Resolve medicine packSize and formulation for dose-unit to stock-unit conversion ---
       let packSize = 1; // default: 1 dose-unit per stock unit (tablets)
+      const med = await tx.medicine.findUnique({
+        where: { id: medicineId },
+        select: { packSize: true, unit: true, form: true },
+      });
+      packSize = (med?.packSize && med.packSize > 0) ? med.packSize : 1;
+
+      const isLiquid = ['syrup', 'suspension', 'liquid', 'elixir', 'oral solution'].includes((med?.form || '').toLowerCase()) ||
+        ((med?.unit || '').toLowerCase() === 'bottle' && packSize > 1);
+
       if (dispensedMl && dispensedMl > 0) {
-        const med = await tx.medicine.findUnique({
-          where: { id: medicineId },
-          select: { packSize: true },
-        });
-        packSize = (med?.packSize && med.packSize > 0) ? med.packSize : 1;
-        // Convert requested ml volume to bottles needed (ceil so we always pull enough)
+        // Syrup/liquid path: convert requested ml volume to bottles needed (ceil so we always pull enough)
         quantityToDispense = Math.max(1, Math.ceil(dispensedMl / packSize));
+      } else if (packSize > 1 && ['box', 'strip', 'pack', 'blister', 'bottle'].includes((med?.unit || '').toLowerCase())) {
+        // Discrete boxed/stripped medications where quantityToDispense is passed as tablets/capsules:
+        // Convert requested dose units to stock packages (boxes/strips)
+        quantityToDispense = Math.max(1, Math.ceil(quantityToDispense / packSize));
       }
 
       // 1. Get all available unexpired stock batches for this medicine, ordered by expiry date (FIFO)
@@ -252,9 +260,11 @@ export class PharmacyService {
       // 2. Check if we have enough total stock
       const totalAvailable = availableBatches.reduce((sum: number, b: any) => sum + b.currentQuantity, 0);
       if (totalAvailable < quantityToDispense) {
-        const availableMl = dispensedMl ? `${totalAvailable * packSize} ml` : `${totalAvailable} units`;
-        const requestedMl = dispensedMl ? `${dispensedMl} ml` : `${quantityToDispense} units`;
-        throw new Error(`Insufficient stock. Requested: ${requestedMl}, Available: ${availableMl}`);
+        const availableDose = totalAvailable * packSize;
+        const requestedDose = dispensedMl ? dispensedMl : (packSize > 1 ? quantityToDispense * packSize : quantityToDispense);
+        const unitLabel = dispensedMl ? "ml" : (isLiquid ? "ml" : (med?.unit ? (med.unit.toLowerCase().endsWith('s') ? med.unit : `${med.unit}s`) : "units"));
+        const packageLabel = isLiquid ? "bottles" : (med?.unit ? (med.unit.toLowerCase().endsWith('s') ? med.unit : `${med.unit}s`) : "packages");
+        throw new Error(`Insufficient stock. Requested: ${requestedDose} ${unitLabel}, Available: ${availableDose} ${unitLabel} (${totalAvailable} ${packageLabel})`);
       }
 
       let remainingToDispense = quantityToDispense;
