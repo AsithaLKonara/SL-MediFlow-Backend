@@ -168,13 +168,24 @@ export class PharmacyController {
   async updateMedicine(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      const { name, genericName, category, form, strength, unit, packSize, reorderLevel, barcode } = req.body;
+      const { name, genericName, category, form, strength, unit, packSize, reorderLevel, barcode, retailPrice } = req.body;
 
       if (barcode && !/^\d{10}$/.test(barcode)) {
         return res.status(400).json({ error: "Barcode must be exactly 10 digits." });
       }
 
-      const medicine = await pharmacyService.updateMedicine(id as string, { name, genericName, category, form, strength, unit, packSize: packSize !== undefined ? Number(packSize) : undefined, reorderLevel: reorderLevel ? Number(reorderLevel) : undefined, barcode });
+      const medicine = await pharmacyService.updateMedicine(id as string, {
+        name,
+        genericName,
+        category,
+        form,
+        strength,
+        unit,
+        packSize: packSize !== undefined ? Number(packSize) : undefined,
+        reorderLevel: reorderLevel ? Number(reorderLevel) : undefined,
+        barcode,
+        retailPrice: retailPrice !== undefined ? Number(retailPrice) : undefined
+      });
       res.json(medicine);
     } catch (error: any) {
       if (error.code === 'P2002') {

@@ -489,7 +489,7 @@ export class PharmacyService {
     });
   }
 
-  async updateMedicine(id: string, data: { name?: string; genericName?: string; category?: string; form?: string; strength?: string; unit?: string; packSize?: number; reorderLevel?: number; barcode?: string }) {
+  async updateMedicine(id: string, data: { name?: string; genericName?: string; category?: string; form?: string; strength?: string; unit?: string; packSize?: number; reorderLevel?: number; barcode?: string; retailPrice?: number }) {
     if (data.name) {
       const existingName = await prisma.medicine.findFirst({
         where: {
@@ -507,10 +507,66 @@ export class PharmacyService {
       }
     }
     
-    const result = await withRetry(() => prisma.medicine.update({
-      where: { id },
-      data
+    const { retailPrice, ...otherFields } = data;
+
+    const result = await withRetry(() => prisma.$transaction(async (tx) => {
+      let updatedMedicine;
+
+      if (retailPrice !== undefined && Number(retailPrice) >= 0) {
+        const newPrice = Number(retailPrice);
+        const activeBatches = await tx.stockBatch.findMany({
+          where: {
+            medicineId: id,
+            currentQuantity: { gt: 0 },
+            status: "ACTIVE"
+          },
+          orderBy: { createdAt: "asc" }
+        });
+
+        for (const oldBatch of activeBatches) {
+          if (oldBatch.unitPrice !== newPrice) {
+            const remainingQty = oldBatch.currentQuantity;
+            const revisionSuffix = `-R${Date.now().toString().slice(-4)}`;
+            const newBatch = await tx.stockBatch.create({
+              data: {
+                medicineId: id,
+                batchNumber: `${oldBatch.batchNumber}${revisionSuffix}`,
+                expiryDate: oldBatch.expiryDate,
+                initialQuantity: remainingQty,
+                currentQuantity: remainingQty,
+                unitPrice: newPrice,
+                costPrice: oldBatch.costPrice,
+                status: "ACTIVE"
+              }
+            });
+            await tx.stockBatch.update({
+              where: { id: oldBatch.id },
+              data: {
+                currentQuantity: 0,
+                status: "SUPERSEDED",
+                supersededById: newBatch.id
+              }
+            });
+          }
+        }
+
+        updatedMedicine = await tx.medicine.update({
+          where: { id },
+          data: {
+            ...otherFields,
+            retailPrice: newPrice
+          }
+        });
+      } else {
+        updatedMedicine = await tx.medicine.update({
+          where: { id },
+          data: otherFields
+        });
+      }
+
+      return updatedMedicine;
     }));
+
     clearCache("pharmacy/medicines").catch(() => {});
     clearCache("pharmacy/metrics").catch(() => {});
     return result;
