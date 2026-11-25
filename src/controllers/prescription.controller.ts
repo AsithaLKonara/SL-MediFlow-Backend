@@ -19,7 +19,7 @@ const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delay = 10
   }
 };
 
-export const VALID_FREQUENCIES = ["OD", "BD", "TDS", "QDS", "QID", "EOD", "STAT", "CUSTOM"] as const;
+export const VALID_FREQUENCIES = ["OD", "BD", "TDS", "QDS", "QID", "MANE", "NOCTE", "EOD", "STAT", "CUSTOM"] as const;
 export const VALID_ROUTES = ["ORAL", "SUPPOSITORY", "IM", "IV", "SC", "OTHER"] as const;
 
 export const calcDispenseQty = (item: any): number => {
@@ -68,7 +68,14 @@ export const calcDispenseQty = (item: any): number => {
     if (!isNaN(parsed) && parsed > 0) timesPerDay = parsed;
   }
 
-  if (freq === "OD" || freq === "ONCE DAILY") {
+  if (
+    freq === "OD" ||
+    freq === "ONCE DAILY" ||
+    freq === "MANE" ||
+    freq === "MORNING" ||
+    freq === "NOCTE" ||
+    freq === "NIGHT"
+  ) {
     timesPerDay = 1;
   } else if (freq === "BD" || freq === "BID" || freq === "TWICE DAILY") {
     timesPerDay = 2;

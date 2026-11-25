@@ -68,10 +68,18 @@ console.log("✔ PASS: Fractional / half-tablet dosages calculate accurately and
 
 // Test 6: Canonical Vocabulary Check
 console.log("Test 6: Canonical Vocabulary Validation");
-const expectedFrequencies = ["OD", "BD", "TDS", "QDS", "QID", "EOD", "STAT", "CUSTOM"];
+const expectedFrequencies = ["OD", "BD", "TDS", "QDS", "QID", "MANE", "NOCTE", "EOD", "STAT", "CUSTOM"];
 for (const freq of expectedFrequencies) {
   assert.ok(VALID_FREQUENCIES.includes(freq as any), `Frequency ${freq} should be in VALID_FREQUENCIES`);
 }
+
+// Test 7: Mane and Nocte Clinical Calculation
+console.log("Test 7: Mane and Nocte Clinical Calculation");
+const maneItem = calcDispenseQty({ frequency: "MANE", dosageAmount: "1", duration: "7 days" });
+assert.equal(maneItem, 7, "MANE with 1 unit over 7 days should calculate 7 units");
+const nocteItem = calcDispenseQty({ frequency: "NOCTE", dosageAmount: "1", duration: "10 days" });
+assert.equal(nocteItem, 10, "NOCTE with 1 unit over 10 days should calculate 10 units");
+console.log("✔ PASS: Mane and Nocte calculate accurate daily quantities.\n");
 
 const expectedRoutes = ["ORAL", "SUPPOSITORY", "IM", "IV", "SC", "OTHER"];
 for (const route of expectedRoutes) {
