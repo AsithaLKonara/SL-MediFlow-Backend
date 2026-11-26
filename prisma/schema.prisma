@@ -82,6 +82,8 @@ model StockBatch {
   currentQuantity Int
   unitPrice       Float
   costPrice       Float     @default(0)
+  status          String    @default("ACTIVE") // ACTIVE, SUPERSEDED, DEPLETED, WRITTEN_OFF
+  supersededById  String?   // If repriced, points to new batch created from remaining stock
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   medicine        Medicine  @relation(fields: [medicineId], references: [id])
@@ -89,6 +91,7 @@ model StockBatch {
   @@unique([medicineId, batchNumber])
   @@index([expiryDate])
   @@index([medicineId, currentQuantity, expiryDate])
+  @@index([status])
 }
 
 model PurchaseOrder {
@@ -130,6 +133,8 @@ model Invoice {
   updatedAt      DateTime          @updatedAt
   lineItems      InvoiceLineItem[]
   payments       Payment[]
+  Patient        Patient?          @relation(fields: [patientId], references: [id], onDelete: SetNull)
+  Visit          Appointment?      @relation(fields: [visitId], references: [id], onDelete: SetNull)
 
   @@index([status])
   @@index([createdAt])
@@ -205,8 +210,9 @@ model LabTest {
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  items      LabRequestItem[]
-  biomarkers LabTestBiomarker[]
+  items         LabRequestItem[]
+  biomarkers    LabTestBiomarker[]
+  priceVersions LabTestPriceVersion[]
 }
 
 model LabTestBiomarker {
@@ -233,6 +239,11 @@ model LabRequest {
   priority        String    @default("ROUTINE")
   reportUrl       String?
   visitId         String?
+  outsourcePaid      Boolean   @default(false)
+  outsourcePaidAt    DateTime?
+  outsourceReceiptNo String?
+  outsourcePaidTo    String?
+  outsourcePaidCost  Float?
 
   Patient Patient          @relation(fields: [patientId], references: [id])
   Visit   Appointment?     @relation(fields: [visitId], references: [id])
@@ -269,14 +280,24 @@ model LabResult {
 }
 
 model Expense {
-  id          String   @id @default(uuid())
-  category    String
-  amount      Float
-  description String
-  status      String   @default("COMPLETED")
-  date        DateTime @default(now())
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id             String             @id @default(uuid())
+  category       String
+  amount         Float
+  description    String
+  status         String             @default("COMPLETED")
+  date           DateTime           @default(now())
+  paymentMethod  String             @default("CASH")
+  shiftId        String?
+  userId         String?
+  receiptNumber  String?            @unique
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  shift          CashRegisterShift? @relation(fields: [shiftId], references: [id])
+  user           User?              @relation(fields: [userId], references: [id])
+
+  @@index([shiftId])
+  @@index([userId])
+  @@index([date])
 }
 
 model Prescription {
@@ -294,6 +315,7 @@ model Prescription {
   updatedAt     DateTime           @updatedAt
   items         PrescriptionItem[]
   Patient       Patient            @relation(fields: [patientId], references: [id])
+  Visit         Appointment        @relation(fields: [visitId], references: [id], onDelete: Cascade)
 
   @@index([patientId])
   @@index([status])
@@ -346,6 +368,7 @@ model Patient {
   Prescription Prescription[]
   Appointment  Appointment[]
   ExtraServiceOrders ExtraServiceOrder[]
+  Invoices     Invoice[]
 
   @@index([phone])
   @@index([fullName])
@@ -414,6 +437,8 @@ model Appointment {
   roomId           String?
   room             Room?                  @relation(fields: [roomId], references: [id])
   LabRequests      LabRequest[]
+  Invoices         Invoice[]
+  Prescriptions    Prescription[]
 
   @@unique([sessionId, appointmentDate, tokenNumber])
   @@index([appointmentDate, doctorId])
@@ -467,6 +492,9 @@ model User {
   DoctorDailySheets      DoctorDailySheet[]
   EmployeeProfile        EmployeeProfile?
   ExtraServiceOrders     ExtraServiceOrder[]
+  ExtraServices          ExtraService[]          @relation("ExtraServiceDoctor")
+  expenses               Expense[]
+  feeVersions            DoctorFeeVersion[]
 }
 
 model DoctorSchedule {
@@ -568,40 +596,51 @@ model ActivityLog {
 }
 
 model ExtraService {
-  id          String   @id @default(uuid())
-  title       String
-  description String?
-  price       Float
-  barcode     String   @unique
-  roomId      String?
-  room        Room?    @relation(fields: [roomId], references: [id])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                     String    @id @default(uuid())
+  title                  String
+  description            String?
+  price                  Float
+  barcode                String    @unique
+  roomId                 String?
+  room                   Room?     @relation(fields: [roomId], references: [id])
+  doctorId               String?
+  doctor                 User?     @relation("ExtraServiceDoctor", fields: [doctorId], references: [id])
+  doctorCommissionType   String?   @default("PERCENTAGE") // PERCENTAGE or FLAT
+  doctorCommissionRate   Float?    @default(0)
+  hospitalCommissionType String?   @default("PERCENTAGE") // PERCENTAGE or FLAT
+  hospitalCommissionRate Float?    @default(0)
+  isActive               Boolean   @default(true)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
 
-  orders      ExtraServiceOrder[]
+  orders                 ExtraServiceOrder[]
+  priceVersions          ExtraServicePriceVersion[]
 }
 
 model ExtraServiceOrder {
-  id              String        @id @default(uuid())
-  orderNumber     String        @unique
-  serviceId       String
-  service         ExtraService  @relation(fields: [serviceId], references: [id])
-  patientId       String
-  patient         Patient       @relation(fields: [patientId], references: [id])
-  doctorId        String?
-  doctor          User?         @relation(fields: [doctorId], references: [id])
-  visitId         String?
-  customPrice     Float?        // Doctor OPD price override
-  finalPrice      Float         // Effective billed price
-  status          String        @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED, CANCELLED
-  notes           String?
-  certificateType String?       // GENERAL, SICK_LEAVE, FITNESS
-  certificateData Json?         // Form fields (leaveDays, diagnosis, fitRemarks, etc.)
-  reportFiles     Json?         // Array of uploaded file objects [{ id, fileName, fileUrl, fileType, fileSize, uploadedAt, uploadedBy }]
-  completedAt     DateTime?
-  createdAt       DateTime      @default(now())
-  updatedAt       DateTime      @updatedAt
+  id                     String        @id @default(uuid())
+  orderNumber            String        @unique
+  serviceId              String
+  service                ExtraService  @relation(fields: [serviceId], references: [id])
+  patientId              String
+  patient                Patient       @relation(fields: [patientId], references: [id])
+  doctorId               String?
+  doctor                 User?         @relation(fields: [doctorId], references: [id])
+  visitId                String?
+  customPrice            Float?        // Doctor OPD price override
+  finalPrice             Float         // Effective billed price
+  doctorCommissionType   String?       @default("PERCENTAGE")
+  doctorCommissionRate   Float?        @default(0)
+  doctorShare            Float?        @default(0)
+  hospitalShare          Float?        @default(0)
+  status                 String        @default("PENDING") // PENDING, IN_PROGRESS, COMPLETED, CANCELLED
+  notes                  String?
+  certificateType        String?       // GENERAL, SICK_LEAVE, FITNESS
+  certificateData        Json?         // Form fields (leaveDays, diagnosis, fitRemarks, etc.)
+  reportFiles            Json?         // Array of uploaded file objects [{ id, fileName, fileUrl, fileType, fileSize, uploadedAt, uploadedBy }]
+  completedAt            DateTime?
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
 
   @@index([patientId])
   @@index([status])
@@ -640,6 +679,7 @@ model CashRegisterShift {
   user         User      @relation(fields: [openedBy], references: [id])
   payments     Payment[]
   refunds      Refund[]
+  expenses     Expense[]
 }
 
 model StaffAttendance {
@@ -949,3 +989,63 @@ model DoctorDailyPatientItem {
 
   @@index([dailySheetId])
 }
+
+// ─── Forward-Only Price Versioning Models (Milestone 10 / R11) ─────────────
+
+model LabTestPriceVersion {
+  id                 String    @id @default(uuid())
+  labTestId          String
+  price              Float
+  hospitalCommission Float     @default(0)
+  commissionType     String    @default("PERCENTAGE") // PERCENTAGE or FLAT
+  outsourceCost      Float     @default(0)
+  effectiveFrom      DateTime  @default(now())
+  effectiveTo        DateTime?
+  isActive           Boolean   @default(true)
+  createdBy          String?
+  createdAt          DateTime  @default(now())
+
+  labTest            LabTest   @relation(fields: [labTestId], references: [id], onDelete: Cascade)
+
+  @@index([labTestId, effectiveFrom])
+  @@index([isActive])
+}
+
+model ExtraServicePriceVersion {
+  id                     String       @id @default(uuid())
+  serviceId              String
+  price                  Float
+  doctorCommissionRate   Float        @default(0)
+  doctorCommissionType   String       @default("PERCENTAGE") // PERCENTAGE or FLAT
+  hospitalCommissionRate Float        @default(0)
+  hospitalCommissionType String       @default("PERCENTAGE") // PERCENTAGE or FLAT
+  effectiveFrom          DateTime     @default(now())
+  effectiveTo            DateTime?
+  isActive               Boolean      @default(true)
+  createdBy              String?
+  createdAt              DateTime     @default(now())
+
+  service                ExtraService @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@index([serviceId, effectiveFrom])
+  @@index([isActive])
+}
+
+model DoctorFeeVersion {
+  id              String    @id @default(uuid())
+  doctorId        String
+  consultationFee Float
+  commissionRate  Float     @default(20)
+  commissionType  String    @default("PERCENTAGE") // PERCENTAGE or FLAT
+  effectiveFrom   DateTime  @default(now())
+  effectiveTo     DateTime?
+  isActive        Boolean   @default(true)
+  createdBy       String?
+  createdAt       DateTime  @default(now())
+
+  doctor          User      @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([doctorId, effectiveFrom])
+  @@index([isActive])
+}
+

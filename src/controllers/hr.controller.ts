@@ -1,6 +1,13 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { websocketService } from "../services/websocket.service.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
+import {
+  generatePayrollSchema,
+  applyLeaveSchema,
+  updateLeaveStatusSchema,
+  createSalaryComponentSchema
+} from "../schemas/hr.schema.js";
 
 // === ATTENDANCE ===
 
@@ -9,8 +16,7 @@ export const clockIn = async (req: Request, res: Response) => {
     const { userId } = req.body; // or req.user.id if using auth middleware
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { startOfDay: today } = getTimezoneBoundaries();
 
     let attendance = await prisma.staffAttendance.findUnique({
       where: {
@@ -45,8 +51,7 @@ export const clockOut = async (req: Request, res: Response) => {
     const { userId } = req.body;
     if (!userId) return res.status(400).json({ error: "userId is required" });
 
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { startOfDay: today } = getTimezoneBoundaries();
 
     const attendance = await prisma.staffAttendance.findUnique({
       where: {
@@ -92,10 +97,15 @@ export const getAttendance = async (req: Request, res: Response) => {
 
 export const applyLeave = async (req: Request, res: Response) => {
   try {
-    const { userId, type, startDate, endDate, reason } = req.body;
-    if (!userId || !type || !startDate || !endDate || !reason) {
-      return res.status(400).json({ error: "Missing required fields" });
+    const parsed = applyLeaveSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues.map(i => i.message).join(", ")
+      });
     }
+
+    const { userId, type, startDate, endDate, reason } = parsed.data;
 
     const leave = await prisma.leaveRequest.create({
       data: {
@@ -167,22 +177,22 @@ export const getLeaves = async (req: Request, res: Response) => {
 export const updateLeaveStatus = async (req: Request, res: Response) => {
   try {
     const id = req.params.id as string;
-    const { status, rejectionReason } = req.body;
-    const reviewerId = (req as any).user?.id || null;
-    
-    if (!['APPROVED', 'REJECTED'].includes(status)) {
-      return res.status(400).json({ error: "Invalid status. Must be APPROVED or REJECTED" });
+    const parsed = updateLeaveStatusSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues.map(i => i.message).join(", ")
+      });
     }
 
-    if (status === 'REJECTED' && (!rejectionReason || !rejectionReason.trim())) {
-      return res.status(400).json({ error: "Rejection reason is required when rejecting a leave request" });
-    }
+    const { status, rejectionReason } = parsed.data;
+    const reviewerId = (req as any).user?.id || null;
 
     const updated = await prisma.leaveRequest.update({
       where: { id },
       data: {
         status,
-        rejectionReason: status === 'REJECTED' ? rejectionReason.trim() : null,
+        rejectionReason: status === 'REJECTED' ? rejectionReason?.trim() || null : null,
         reviewedAt: new Date(),
         reviewedById: reviewerId
       },
@@ -216,7 +226,15 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
 export const generatePayroll = async (req: Request, res: Response) => {
   try {
-    const { periodStart, periodEnd } = req.body;
+    const parsed = generatePayrollSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues.map(i => i.message).join(", ")
+      });
+    }
+
+    const { periodStart, periodEnd } = parsed.data;
     
     const start = new Date(periodStart);
     const end = new Date(periodEnd);
@@ -813,7 +831,15 @@ export const getSalaryComponents = async (req: Request, res: Response) => {
 
 export const createSalaryComponent = async (req: Request, res: Response) => {
   try {
-    const { code, name, category, calculationMethod, isTaxable, isEpfEligible } = req.body;
+    const parsed = createSalaryComponentSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        error: parsed.error.issues.map(i => i.message).join(", ")
+      });
+    }
+
+    const { code, name, category, calculationMethod, isTaxable, isEpfEligible } = parsed.data;
     
     const component = await prisma.salaryComponent.create({
       data: {

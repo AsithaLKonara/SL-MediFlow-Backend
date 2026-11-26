@@ -1,6 +1,10 @@
 import { prisma } from "../lib/prisma.js";
 import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 import { websocketService } from "./websocket.service.js";
+import { recordDoctorShareOnPayment, reverseDoctorShareOnRefund } from "../controllers/fund-office.controller.js";
+import { synchronizeVisitCancellation } from "./cancellation-sync.service.js";
+import { NotificationService } from "./notification.service.js";
+import { isOpdDoctor } from "../utils/doctor-utils.js";
 
 export class BillingService {
   /**
@@ -112,9 +116,13 @@ export class BillingService {
       }
     }
 
-    // 2.6 Guard against duplicate charges by referenceId OR duplicate medical certificates on this invoice
+    // 2.6 Guard against duplicate charges by referenceId, duplicate certificates, or matching extra service description
     const isCertItem = data.department === "EXTRA_SERVICE" && Boolean(data.description?.toLowerCase().includes("certificate"));
-    if (data.referenceId || isCertItem) {
+    const cleanSvcDesc = (data.department === "EXTRA_SERVICE" || data.department === "SERVICE") && data.description
+      ? data.description.replace(/^extra service:\s*/i, '').trim()
+      : null;
+
+    if (data.referenceId || isCertItem || cleanSvcDesc) {
       const existingItem = await db.invoiceLineItem.findFirst({
         where: {
           invoiceId: invoice.id,
@@ -124,6 +132,15 @@ export class BillingService {
               {
                 department: "EXTRA_SERVICE",
                 description: { contains: "Certificate", mode: "insensitive" }
+              }
+            ] : []),
+            ...(cleanSvcDesc ? [
+              {
+                department: { in: ["EXTRA_SERVICE", "SERVICE"] },
+                OR: [
+                  { description: { equals: cleanSvcDesc, mode: "insensitive" } },
+                  { description: { equals: `Extra Service: ${cleanSvcDesc}`, mode: "insensitive" } }
+                ]
               }
             ] : [])
           ]
@@ -373,7 +390,7 @@ export class BillingService {
     shiftId?: string,
     discount?: { type?: string; value?: number; amount?: number; reason?: string }
   ) {
-    return prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       const invoice = await tx.invoice.findUnique({ where: { id: invoiceId } });
       if (!invoice) throw new Error("Invoice not found");
       if (invoice.status === "PAID") throw new Error("Invoice is already paid");
@@ -440,12 +457,82 @@ export class BillingService {
         include: { lineItems: true, payments: true }
       });
     });
+
+    // Auto-record doctor share if invoice contains a consultation fee
+    recordDoctorShareOnPayment(invoiceId).catch((err) =>
+      console.error("Error auto-recording doctor share on billing payInvoice:", err)
+    );
+
+    // Auto-dispatch OPD Bill SMS if this invoice belongs to an OPD patient/consultation
+    try {
+      const inv = await prisma.invoice.findUnique({
+        where: { id: invoiceId }
+      });
+      if (inv && inv.patientId) {
+        const patient = await prisma.patient.findUnique({
+          where: { id: inv.patientId }
+        });
+        const isSystemGenerated = !patient?.phone || 
+          patient.phone.startsWith('WALKIN') || 
+          patient.phone.startsWith('NO-PHONE') || 
+          patient.phone.startsWith('NO_PHONE');
+        if (patient?.phone && !isSystemGenerated) {
+          const visitRef = inv.visitId;
+          const linkedAppt = visitRef ? await prisma.appointment.findFirst({
+            where: {
+              OR: [
+                { id: visitRef },
+                { bookingReference: visitRef }
+              ]
+            },
+            include: { User: { include: { Department: true } } }
+          }) : null;
+
+          if (linkedAppt && isOpdDoctor(linkedAppt.User)) {
+            const billRefStr = (inv as any).invoiceNumber || linkedAppt.bookingReference || `INV-${inv.id.slice(0, 8).toUpperCase()}`;
+            const alreadySent = await prisma.notificationJob.findFirst({
+              where: {
+                patientId: inv.patientId,
+                message: { contains: billRefStr }
+              }
+            });
+            if (!alreadySent) {
+              NotificationService.sendOpdBillSMS({
+                patientId: inv.patientId,
+                phone: patient.phone,
+                patientName: patient.fullName,
+                doctorName: linkedAppt.User?.fullName || 'OPD Doctor',
+                tokenNumber: linkedAppt.tokenNumber,
+                totalAmount: inv.totalAmount,
+                billRef: billRefStr
+              }).catch(console.error);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Error triggering OPD bill SMS in payInvoice:", e);
+    }
+
+    return result;
   }
 
   async getCashierMetrics() {
     const { startOfDay } = getTimezoneBoundaries();
 
-    const [pendingInvoices, completedToday, todayGrossRevenueObj, recentPayments, pendingDrafts, todayRefundsObj] = await Promise.all([
+    const [
+      pendingInvoices,
+      completedToday,
+      todayGrossRevenueObj,
+      recentPayments,
+      pendingDrafts,
+      todayRefundsObj,
+      todayCashRevenueObj,
+      todayCashRefundsObj,
+      todayCashExpensesObj,
+      todayDoctorCashDisbursedObj,
+      activeShiftsFloatObj
+    ] = await Promise.all([
       prisma.invoice.aggregate({
         where: { status: 'DRAFT' },
         _count: { _all: true }
@@ -471,13 +558,64 @@ export class BillingService {
       prisma.refund.aggregate({
         where: { createdAt: { gte: startOfDay }, status: 'COMPLETED' },
         _sum: { amount: true }
+      }),
+      // Aggregate real cash payments
+      prisma.payment.aggregate({
+        where: {
+          createdAt: { gte: startOfDay },
+          status: { in: ['COMPLETED', 'REFUNDED'] },
+          method: { equals: 'CASH', mode: 'insensitive' }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate real cash refunds
+      prisma.refund.aggregate({
+        where: {
+          createdAt: { gte: startOfDay },
+          status: 'COMPLETED',
+          payment: {
+            method: { equals: 'CASH', mode: 'insensitive' }
+          }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate real cash expenses/cashouts from drawer
+      prisma.expense.aggregate({
+        where: {
+          date: { gte: startOfDay },
+          status: 'COMPLETED',
+          paymentMethod: { equals: 'CASH', mode: 'insensitive' }
+        },
+        _sum: { amount: true }
+      }),
+      // Aggregate doctor cash share disbursements
+      prisma.doctorDailySheet.aggregate({
+        where: {
+          paidAt: { gte: startOfDay },
+          cashDisbursed: { gt: 0 }
+        },
+        _sum: { cashDisbursed: true }
+      }),
+      // Aggregate active open cash register shifts opening float
+      prisma.cashRegisterShift.aggregate({
+        where: { status: 'OPEN' },
+        _sum: { openingFloat: true }
       })
     ]);
 
     const grossRevenue = todayGrossRevenueObj._sum.amount || 0;
     const refunds = todayRefundsObj._sum.amount || 0;
-    const totalRevenue = grossRevenue - refunds;
-    const cashInDrawer = totalRevenue * 0.4; // Estimate 40% is cash for UI purposes
+    const totalRevenue = Math.round((grossRevenue - refunds) * 100) / 100;
+
+    // Exact cash in drawer reconciliation
+    const grossCash = todayCashRevenueObj._sum.amount || 0;
+    const cashRefunds = todayCashRefundsObj._sum.amount || 0;
+    const cashExpenses = todayCashExpensesObj._sum.amount || 0;
+    const docCashDisbursed = todayDoctorCashDisbursedObj._sum.cashDisbursed || 0;
+    const openingFloat = activeShiftsFloatObj._sum.openingFloat || 0;
+
+    const netCashInDrawer = openingFloat + grossCash - cashRefunds - cashExpenses - docCashDisbursed;
+    const cashInDrawer = Math.max(0, Math.round(netCashInDrawer * 100) / 100);
 
     const recentTransactions: any[] = [];
 
@@ -521,7 +659,7 @@ export class BillingService {
    * Processes a refund for a specific payment, supporting partial or full refunds.
    */
   async processRefund(paymentId: string, amount: number, reason: string, shiftId?: string) {
-    return prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       // 1. Lock the payment row to serialize concurrent refunds
       await tx.$executeRaw`SELECT id FROM "Payment" WHERE id = ${paymentId} FOR UPDATE`;
 
@@ -554,8 +692,10 @@ export class BillingService {
         }
       });
 
+      const isFullyRefunded = amount === (payment.amount - refundedAmount);
+
       // If fully refunded, mark the parent records
-      if (amount === (payment.amount - refundedAmount)) {
+      if (isFullyRefunded) {
         await tx.payment.update({
           where: { id: paymentId },
           data: { status: "REFUNDED" }
@@ -566,8 +706,29 @@ export class BillingService {
         });
       }
 
-      return refund;
+      return {
+        refund,
+        invoiceId: payment.invoiceId,
+        visitId: payment.invoice?.visitId,
+        isFullyRefunded
+      };
     });
+
+    // If refund was processed, check and reverse doctor share if consultation was refunded
+    if (result?.invoiceId) {
+      reverseDoctorShareOnRefund(result.invoiceId).catch((err) =>
+        console.error("Error reversing doctor share on billing refund:", err)
+      );
+    }
+
+    // If fully refunded, synchronize cancellation to cancel pending labs and extra services
+    if (result?.isFullyRefunded && result?.visitId) {
+      synchronizeVisitCancellation(result.visitId, `Invoice Refund: ${reason}`).catch((err) =>
+        console.warn("Error synchronizing visit cancellation on billing refund:", err)
+      );
+    }
+
+    return result.refund;
   }
 
   /**
@@ -622,11 +783,9 @@ export class BillingService {
     const where: any = {};
     if (query.startDate || query.endDate) {
       where.createdAt = {};
-      if (query.startDate) where.createdAt.gte = new Date(query.startDate);
+      if (query.startDate) where.createdAt.gte = getTimezoneBoundaries(query.startDate).startOfDay;
       if (query.endDate) {
-        const end = new Date(query.endDate);
-        end.setHours(23, 59, 59, 999);
-        where.createdAt.lte = end;
+        where.createdAt.lte = getTimezoneBoundaries(query.endDate).endOfDay;
       }
     }
 

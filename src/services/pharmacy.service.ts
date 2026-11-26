@@ -1,6 +1,7 @@
 import { prisma, withRetry } from "../lib/prisma.js";
 import { BillingService } from "./billing.service.js";
 import { clearCache } from "../middlewares/cache.middleware.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 const billingService = new BillingService();
 
@@ -116,28 +117,130 @@ export class PharmacyService {
 
   // --- INVENTORY MANAGEMENT ---
   async addStockBatch(data: { medicineId: string; batchNumber: string; expiryDate?: Date; initialQuantity: number; unitPrice: number }) {
-    const result = await withRetry(() => prisma.stockBatch.create({
-      data: {
-        ...data,
-        expiryDate: data.expiryDate || null,
-        currentQuantity: data.initialQuantity,
-      },
+    const result = await withRetry(() => prisma.$transaction(async (tx) => {
+      const batch = await tx.stockBatch.create({
+        data: {
+          ...data,
+          expiryDate: data.expiryDate || null,
+          currentQuantity: data.initialQuantity,
+          status: "ACTIVE"
+        },
+      });
+      // Forward-only sync of medicine retailPrice to the latest added batch price
+      await tx.medicine.update({
+        where: { id: data.medicineId },
+        data: { retailPrice: data.unitPrice }
+      });
+      return batch;
     }));
     clearCache("pharmacy/medicines").catch(() => {});
     clearCache("pharmacy/metrics").catch(() => {});
     return result;
   }
 
+  /**
+   * Forward-only repricing of an existing stock batch.
+   * Prevents corruption of historical sales/dispenses by:
+   * 1. Moving remaining currentQuantity into a newly spawned StockBatch at newPrice.
+   * 2. Marking old batch as SUPERSEDED with currentQuantity=0.
+   */
+  async repriceStockBatch(batchId: string, newPrice: number, reason?: string) {
+    if (newPrice < 0) throw new Error("Price cannot be negative");
+
+    return withRetry(() => prisma.$transaction(async (tx) => {
+      const oldBatch = await tx.stockBatch.findUnique({
+        where: { id: batchId },
+        include: { medicine: true }
+      });
+      if (!oldBatch) throw new Error("Batch not found");
+
+      const remainingQty = oldBatch.currentQuantity;
+      if (remainingQty <= 0) {
+        throw new Error("Cannot reprice a depleted batch with zero quantity");
+      }
+
+      // 1. Create new batch for remaining stock with new price
+      const revisionSuffix = `-R${Date.now().toString().slice(-4)}`;
+      const newBatch = await tx.stockBatch.create({
+        data: {
+          medicineId: oldBatch.medicineId,
+          batchNumber: `${oldBatch.batchNumber}${revisionSuffix}`,
+          expiryDate: oldBatch.expiryDate,
+          initialQuantity: remainingQty,
+          currentQuantity: remainingQty,
+          unitPrice: newPrice,
+          costPrice: oldBatch.costPrice,
+          status: "ACTIVE"
+        }
+      });
+
+      // 2. Mark old batch as SUPERSEDED with zero remaining quantity
+      await tx.stockBatch.update({
+        where: { id: batchId },
+        data: {
+          currentQuantity: 0,
+          status: "SUPERSEDED",
+          supersededById: newBatch.id
+        }
+      });
+
+      // 3. Update medicine retailPrice forward-only
+      await tx.medicine.update({
+        where: { id: oldBatch.medicineId },
+        data: { retailPrice: newPrice }
+      });
+
+      clearCache("pharmacy/medicines").catch(() => {});
+      clearCache("pharmacy/metrics").catch(() => {});
+
+      return {
+        success: true,
+        message: `Forward-only price revision: Created batch ${newBatch.batchNumber} with ${remainingQty} units at LKR ${newPrice.toFixed(2)}. Old batch ${oldBatch.batchNumber} marked SUPERSEDED.`,
+        oldBatchId: oldBatch.id,
+        newBatch
+      };
+    }));
+  }
+
   // --- DISPENSING ENGINE (FIFO LOGIC) ---
+  /**
+   * Dispense a medicine from stock using FIFO batch ordering.
+   *
+   * For syrups/liquids pass dispensedMl (volume in ml to dispense).
+   * The service converts ml → bottles for stock deduction and bills per-ml.
+   * For solid forms (tablets, capsules, etc.) dispensedMl must be omitted.
+   */
   async dispenseMedicine(
     medicineId: string, 
     quantityToDispense: number,
     billingInfo?: { visitId?: string; patientId?: string; description?: string, skipBilling?: boolean },
-    existingTx?: any
+    existingTx?: any,
+    /** Volume in ml to dispense (syrups/liquids only). When set, overrides qty-based billing. */
+    dispensedMl?: number
   ) {
     const executeLogic = async (tx: any) => {
       // Lock all batches for this medicine to serialize concurrent dispensing
       await tx.$executeRaw`SELECT id FROM "StockBatch" WHERE "medicineId" = ${medicineId} FOR UPDATE`;
+
+      // --- Resolve medicine packSize and formulation for dose-unit to stock-unit conversion ---
+      let packSize = 1; // default: 1 dose-unit per stock unit (tablets)
+      const med = await tx.medicine.findUnique({
+        where: { id: medicineId },
+        select: { packSize: true, unit: true, form: true },
+      });
+      packSize = (med?.packSize && med.packSize > 0) ? med.packSize : 1;
+
+      const isLiquid = ['syrup', 'suspension', 'liquid', 'elixir', 'oral solution'].includes((med?.form || '').toLowerCase()) ||
+        ((med?.unit || '').toLowerCase() === 'bottle' && packSize > 1);
+
+      if (dispensedMl && dispensedMl > 0) {
+        // Syrup/liquid path: convert requested ml volume to bottles needed (ceil so we always pull enough)
+        quantityToDispense = Math.max(1, Math.ceil(dispensedMl / packSize));
+      } else if (packSize > 1 && ['box', 'strip', 'pack', 'blister', 'bottle'].includes((med?.unit || '').toLowerCase())) {
+        // Discrete boxed/stripped medications where quantityToDispense is passed as tablets/capsules:
+        // Convert requested dose units to stock packages (boxes/strips)
+        quantityToDispense = Math.max(1, Math.ceil(quantityToDispense / packSize));
+      }
 
       // 1. Get all available unexpired stock batches for this medicine, ordered by expiry date (FIFO)
       const availableBatches = await tx.stockBatch.findMany({
@@ -157,13 +260,17 @@ export class PharmacyService {
       // 2. Check if we have enough total stock
       const totalAvailable = availableBatches.reduce((sum: number, b: any) => sum + b.currentQuantity, 0);
       if (totalAvailable < quantityToDispense) {
-        throw new Error(`Insufficient stock. Requested: ${quantityToDispense}, Available: ${totalAvailable}`);
+        const availableDose = totalAvailable * packSize;
+        const requestedDose = dispensedMl ? dispensedMl : (packSize > 1 ? quantityToDispense * packSize : quantityToDispense);
+        const unitLabel = dispensedMl ? "ml" : (isLiquid ? "ml" : (med?.unit ? (med.unit.toLowerCase().endsWith('s') ? med.unit : `${med.unit}s`) : "units"));
+        const packageLabel = isLiquid ? "bottles" : (med?.unit ? (med.unit.toLowerCase().endsWith('s') ? med.unit : `${med.unit}s`) : "packages");
+        throw new Error(`Insufficient stock. Requested: ${requestedDose} ${unitLabel}, Available: ${availableDose} ${unitLabel} (${totalAvailable} ${packageLabel})`);
       }
 
       let remainingToDispense = quantityToDispense;
-      const batchesUsed = [];
+      const batchesUsed: Array<{ batchId: string; batchNumber: string; quantityDispensed: number; unitPrice: number }> = [];
 
-      // 3. Loop through batches and deduct stock
+      // 3. Loop through batches and deduct stock (FIFO)
       for (const batch of availableBatches) {
         if (remainingToDispense <= 0) break;
 
@@ -184,8 +291,23 @@ export class PharmacyService {
         remainingToDispense -= quantityFromThisBatch;
       }
 
+      // 4. Calculate billing cost
+      // For syrups: bill proportionally by ml (dispensedMl × pricePerMl)
+      // For solids: bill by whole unit (quantityDispensed × unitPrice)
+      let totalCost: number;
+      if (dispensedMl && dispensedMl > 0 && packSize > 1) {
+        // Weighted average pricePerMl across batches used
+        const totalBottlesBilled = batchesUsed.reduce((s, b) => s + b.quantityDispensed, 0);
+        const weightedBottlePrice = totalBottlesBilled > 0
+          ? batchesUsed.reduce((s, b) => s + (b.quantityDispensed * b.unitPrice), 0) / totalBottlesBilled
+          : 0;
+        const pricePerMl = Number((weightedBottlePrice / packSize).toFixed(4));
+        totalCost = Number((dispensedMl * pricePerMl).toFixed(2));
+      } else {
+        totalCost = batchesUsed.reduce((sum: number, b: any) => sum + (b.quantityDispensed * b.unitPrice), 0);
+      }
+
       if (billingInfo && !billingInfo.skipBilling && (billingInfo.visitId || billingInfo.patientId)) {
-        const totalCost = batchesUsed.reduce((sum: number, b: any) => sum + (b.quantityDispensed * b.unitPrice), 0);
         if (totalCost > 0) {
           await billingService.addCharge({
             visitId: billingInfo.visitId,
@@ -201,9 +323,14 @@ export class PharmacyService {
 
       return {
         success: true,
-        message: `Successfully dispensed ${quantityToDispense} units.`,
+        message: dispensedMl
+          ? `Successfully dispensed ${dispensedMl} ml (${quantityToDispense} bottle(s) deducted).`
+          : `Successfully dispensed ${quantityToDispense} units.`,
         batchesUsed,
-        totalCost: batchesUsed.reduce((sum, b) => sum + (b.quantityDispensed * b.unitPrice), 0)
+        totalCost,
+        /** Present only for syrup dispenses */
+        dispensedMl: dispensedMl ?? null,
+        packSize: dispensedMl ? packSize : null,
       };
     };
 
@@ -314,8 +441,7 @@ export class PharmacyService {
 
   async getMetrics() {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay } = getTimezoneBoundaries();
 
       const pendingPrescriptions = await prisma.prescription.count({
         where: { status: "PENDING" }
@@ -324,7 +450,7 @@ export class PharmacyService {
       const fulfilledToday = await prisma.prescription.count({
         where: {
           status: "DISPENSED",
-          updatedAt: { gte: today }
+          updatedAt: { gte: startOfDay }
         }
       });
 
@@ -359,7 +485,7 @@ export class PharmacyService {
       }));
 
       const pharmacyLines = await prisma.invoiceLineItem.findMany({
-        where: { department: "PHARMACY", createdAt: { gte: today } }
+        where: { department: "PHARMACY", createdAt: { gte: startOfDay } }
       });
       const totalRevenue = pharmacyLines.reduce((sum: number, item: any) => sum + item.total, 0);
 
@@ -373,7 +499,7 @@ export class PharmacyService {
     });
   }
 
-  async updateMedicine(id: string, data: { name?: string; genericName?: string; category?: string; form?: string; strength?: string; unit?: string; packSize?: number; reorderLevel?: number; barcode?: string }) {
+  async updateMedicine(id: string, data: { name?: string; genericName?: string; category?: string; form?: string; strength?: string; unit?: string; packSize?: number; reorderLevel?: number; barcode?: string; retailPrice?: number }) {
     if (data.name) {
       const existingName = await prisma.medicine.findFirst({
         where: {
@@ -391,10 +517,66 @@ export class PharmacyService {
       }
     }
     
-    const result = await withRetry(() => prisma.medicine.update({
-      where: { id },
-      data
+    const { retailPrice, ...otherFields } = data;
+
+    const result = await withRetry(() => prisma.$transaction(async (tx) => {
+      let updatedMedicine;
+
+      if (retailPrice !== undefined && Number(retailPrice) >= 0) {
+        const newPrice = Number(retailPrice);
+        const activeBatches = await tx.stockBatch.findMany({
+          where: {
+            medicineId: id,
+            currentQuantity: { gt: 0 },
+            status: "ACTIVE"
+          },
+          orderBy: { createdAt: "asc" }
+        });
+
+        for (const oldBatch of activeBatches) {
+          if (oldBatch.unitPrice !== newPrice) {
+            const remainingQty = oldBatch.currentQuantity;
+            const revisionSuffix = `-R${Date.now().toString().slice(-4)}`;
+            const newBatch = await tx.stockBatch.create({
+              data: {
+                medicineId: id,
+                batchNumber: `${oldBatch.batchNumber}${revisionSuffix}`,
+                expiryDate: oldBatch.expiryDate,
+                initialQuantity: remainingQty,
+                currentQuantity: remainingQty,
+                unitPrice: newPrice,
+                costPrice: oldBatch.costPrice,
+                status: "ACTIVE"
+              }
+            });
+            await tx.stockBatch.update({
+              where: { id: oldBatch.id },
+              data: {
+                currentQuantity: 0,
+                status: "SUPERSEDED",
+                supersededById: newBatch.id
+              }
+            });
+          }
+        }
+
+        updatedMedicine = await tx.medicine.update({
+          where: { id },
+          data: {
+            ...otherFields,
+            retailPrice: newPrice
+          }
+        });
+      } else {
+        updatedMedicine = await tx.medicine.update({
+          where: { id },
+          data: otherFields
+        });
+      }
+
+      return updatedMedicine;
     }));
+
     clearCache("pharmacy/medicines").catch(() => {});
     clearCache("pharmacy/metrics").catch(() => {});
     return result;

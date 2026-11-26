@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import { calcDispenseQty } from "./prescription.controller.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export const barcodeController = {
   resolveBarcode: async (req: Request, res: Response) => {
@@ -9,11 +10,7 @@ export const barcodeController = {
       if (!rawCode) return res.status(400).json({ error: "Barcode is required" });
       const code = rawCode.trim();
 
-      const now = new Date();
-      const startOfDay = new Date(now);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(now);
-      endOfDay.setHours(23, 59, 59, 999);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
       const isNumeric10 = /^\d{10}$/.test(code);
       const isShortToken = /^\d{1,3}$/.test(code);
@@ -133,15 +130,11 @@ export const barcodeController = {
                   bookingReference: appointment.bookingReference,
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             } else {
-              const apptDate = new Date(appointment.appointmentDate);
-              const apptStart = new Date(apptDate);
-              apptStart.setHours(0, 0, 0, 0);
-              const apptEnd = new Date(apptDate);
-              apptEnd.setHours(23, 59, 59, 999);
+              const { startOfDay: apptStart, endOfDay: apptEnd } = getTimezoneBoundaries(appointment.appointmentDate);
 
               allAppointments = await prisma.appointment.findMany({
                 where: {
@@ -149,7 +142,7 @@ export const barcodeController = {
                   appointmentDate: { gte: apptStart, lte: apptEnd },
                   status: { not: "CANCELLED" }
                 },
-                include: { Patient: true, room: true, User: { include: { room: true } } },
+                include: { Patient: true, room: true, User: { include: { room: true } }, Payment: true },
                 orderBy: { createdAt: "asc" }
               });
             }
@@ -202,6 +195,8 @@ export const barcodeController = {
                         strength: true,
                         packSize: true,
                         stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' },
                           select: { unitPrice: true, currentQuantity: true },
                           take: 1
                         }
@@ -214,6 +209,7 @@ export const barcodeController = {
             }),
             prisma.labRequest.findMany({
               where: {
+                status: { not: "CANCELLED" },
                 OR: [
                   { visitId: { in: allVisitIdentifiers } },
                   {
@@ -236,6 +232,7 @@ export const barcodeController = {
             }),
             prisma.extraServiceOrder.findMany({
               where: {
+                status: { not: "CANCELLED" },
                 OR: [
                   { visitId: { in: allVisitIdentifiers } },
                   {
@@ -253,7 +250,8 @@ export const barcodeController = {
               where: {
                 visitId: { in: allVisitIdentifiers },
                 status: "PAID",
-                lineItems: { some: { department: "CONSULTATION" } }
+                totalAmount: { gt: 0 },
+                lineItems: { some: { department: "CONSULTATION", total: { gt: 0 } } }
               }
             })
           ]);
@@ -262,10 +260,14 @@ export const barcodeController = {
           let mergedInvoice: any = null;
           let rawLineItems = invoices.flatMap(inv => inv.lineItems || []);
 
-          // Deduplicate already existing invoice line items by referenceId or id
+          // Deduplicate already existing invoice line items by referenceId or id, normalizing extra services
           const uniqueLineItemMap = new Map<string, any>();
           for (const li of rawLineItems) {
-            const key = li.referenceId ? `ref-${li.referenceId}` : (li.id ? `id-${li.id}` : `desc-${li.description}`);
+            let key = li.referenceId ? `ref-${li.referenceId}` : (li.id ? `id-${li.id}` : `desc-${li.description}`);
+            if (li.department === "EXTRA_SERVICE" || li.department === "SERVICE") {
+              const cleanDesc = (li.description || '').toLowerCase().replace(/^extra service:\s*/i, '').trim();
+              if (cleanDesc) key = `exs-${cleanDesc}`;
+            }
             if (!uniqueLineItemMap.has(key)) {
               uniqueLineItemMap.set(key, li);
             }
@@ -275,11 +277,14 @@ export const barcodeController = {
           // Ensure any extraServiceOrders not yet in invoice line items are represented
           for (const order of extraServiceOrders) {
             const isCert = Boolean(order.certificateType || order.service?.title?.toLowerCase().includes("certificate"));
+            const cleanTitle = (order.service?.title || '').toLowerCase().trim();
             const alreadyInInvoice = allLineItems.some(
               (li: any) =>
                 li.referenceId === order.id ||
                 (order.orderNumber && li.description?.includes(order.orderNumber)) ||
-                (isCert && li.department === "EXTRA_SERVICE" && li.description?.toLowerCase().includes("certificate"))
+                (isCert && li.department === "EXTRA_SERVICE" && li.description?.toLowerCase().includes("certificate")) ||
+                ((li.department === "EXTRA_SERVICE" || li.department === "SERVICE") &&
+                 li.description?.toLowerCase().replace(/^extra service:\s*/i, '').trim() === cleanTitle)
             );
             if (!alreadyInInvoice && order.status !== "CANCELLED") {
               const orderPrice = order.finalPrice ?? order.service?.price ?? 0;
@@ -317,7 +322,17 @@ export const barcodeController = {
             };
           }
 
-          const consultationPaid = !!paidInvoice;
+          const hasDraftConsult = allLineItems.some(
+            (li: any) => li.department === "CONSULTATION"
+          );
+          const hasUpfrontPayment = allAppointments.some(
+            (a: any) =>
+              (a.department === "CONSULTATION" || a.id === appointment.id) &&
+              a.Payment &&
+              a.Payment.status === "COMPLETED" &&
+              (a.Payment.amount || 0) > 0
+          );
+          const consultationPaid = !hasDraftConsult && (!!paidInvoice || hasUpfrontPayment);
 
           const extraServiceItems = (mergedInvoice?.lineItems || []).filter(
             (li: any) => li.department === "EXTRA_SERVICE" || li.department === "SERVICE" || li.department === "OTHER"
@@ -395,11 +410,37 @@ export const barcodeController = {
         const prescription = isUUID || code.length === 36
           ? await prisma.prescription.findUnique({
               where: { id: code },
-              include: { items: { include: { medicine: { include: { stockBatches: true } } } } }
+              include: {
+                items: {
+                  include: {
+                    medicine: {
+                      include: {
+                        stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             })
           : await prisma.prescription.findFirst({
               where: { id: { startsWith: code } },
-              include: { items: { include: { medicine: { include: { stockBatches: true } } } } }
+              include: {
+                items: {
+                  include: {
+                    medicine: {
+                      include: {
+                        stockBatches: {
+                          where: { currentQuantity: { gt: 0 } },
+                          orderBy: { expiryDate: 'asc' }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
             });
 
         if (prescription) {
@@ -410,14 +451,25 @@ export const barcodeController = {
 
           let consultationPaid = false;
           if (prescription.visitId) {
-            const paidInvoice = await prisma.invoice.findFirst({
+            const hasDraftConsult = await prisma.invoice.findFirst({
               where: {
                 visitId: prescription.visitId,
-                status: "PAID",
+                status: "DRAFT",
                 lineItems: { some: { department: "CONSULTATION" } }
               }
             });
-            if (paidInvoice) consultationPaid = true;
+
+            if (!hasDraftConsult) {
+              const paidInvoice = await prisma.invoice.findFirst({
+                where: {
+                  visitId: prescription.visitId,
+                  status: "PAID",
+                  totalAmount: { gt: 0 },
+                  lineItems: { some: { department: "CONSULTATION", total: { gt: 0 } } }
+                }
+              });
+              if (paidInvoice) consultationPaid = true;
+            }
           }
 
           return res.json({ 
@@ -445,7 +497,12 @@ export const barcodeController = {
             { name: code }
           ]
         },
-        include: { stockBatches: true }
+        include: {
+          stockBatches: {
+            where: { currentQuantity: { gt: 0 } },
+            orderBy: { expiryDate: 'asc' }
+          }
+        }
       });
       if (medicine) {
         return res.json({ type: "MEDICINE", data: medicine });

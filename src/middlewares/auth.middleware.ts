@@ -12,7 +12,7 @@ export interface AuthRequest extends Request {
   };
 }
 
-export const verifyToken = (req: AuthRequest, res: Response, next: NextFunction): void => {
+export const verifyToken = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   const token = req.cookies?.token || req.headers.authorization?.split(" ")[1];
 
   if (!token) {
@@ -22,6 +22,18 @@ export const verifyToken = (req: AuthRequest, res: Response, next: NextFunction)
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as { id: string; roleId: string; email: string };
+
+    // DEFECT-AUTH-02: Ensure deactivated/suspended users cannot use existing JWTs
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+      select: { id: true, isActive: true, roleId: true }
+    });
+
+    if (!user || !user.isActive) {
+      res.status(401).json({ message: "Account is suspended or deactivated. Authorization denied." });
+      return;
+    }
+
     req.user = decoded;
     next();
   } catch (error) {

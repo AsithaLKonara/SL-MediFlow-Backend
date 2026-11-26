@@ -1,8 +1,13 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
-// GET /api/finance/doctor-statements
+/**
+ * @deprecated Legacy doctor settlement mechanism. Standardize on Fund Office DoctorDailySheet.
+ * GET /api/finance/doctor-statements
+ */
 export const getDoctorStatements = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const { doctorId, status, startDate, endDate } = req.query;
 
@@ -38,8 +43,12 @@ export const getDoctorStatements = async (req: Request, res: Response) => {
   }
 };
 
-// POST /api/finance/doctor-statements/generate
+/**
+ * @deprecated Legacy doctor statement generator. Use Fund Office DoctorDailySheet for settlements.
+ * POST /api/finance/doctor-statements/generate
+ */
 export const generateDoctorStatements = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const { periodStart, periodEnd, doctorId, commissionRate: inputCommissionRate, commissionType: inputCommissionType } = req.body;
     const authUser = (req as any).user;
@@ -48,10 +57,8 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "periodStart and periodEnd are required" });
     }
 
-    const start = new Date(periodStart);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(periodEnd);
-    end.setHours(23, 59, 59, 999);
+    const start = getTimezoneBoundaries(periodStart as string).startOfDay;
+    const end = getTimezoneBoundaries(periodEnd as string).endOfDay;
 
     // 1. Find doctors (either specific or all active doctors with specialties)
     const doctorWhere: any = { isActive: true };
@@ -80,10 +87,14 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
             { createdAt: { gte: start, lte: end } }
           ],
         },
-        select: { id: true },
+        select: { id: true, bookingReference: true },
       });
 
-      const visitIds = appointments.map(a => a.id);
+      const visitIds = Array.from(
+        new Set(
+          appointments.flatMap(a => [a.id, a.bookingReference].filter(Boolean) as string[])
+        )
+      );
 
       // Find paid invoices for these visits
       const paidInvoices: any[] = await prisma.invoice.findMany({
@@ -103,16 +114,61 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
 
       let totalCollected = 0;
       let totalConsultations = 0;
+      const countedInvoices = new Set<string>();
 
       for (const inv of paidInvoices) {
-        const consultItem = inv.lineItems?.find((li: any) => li.department === "CONSULTATION");
-        if (consultItem) {
-          const totalRefunds = inv.payments?.reduce((sum: number, p: any) =>
-            sum + (p.refunds?.reduce((rSum: number, r: any) => rSum + r.amount, 0) || 0), 0) || 0;
-          
-          const netRevenue = Math.max(0, (consultItem.total || 0) - totalRefunds);
-          totalCollected += netRevenue;
-          totalConsultations += 1;
+        if (countedInvoices.has(inv.id)) continue;
+        countedInvoices.add(inv.id);
+
+        const consultItems = inv.lineItems?.filter((li: any) => (li.department || "").toUpperCase() === "CONSULTATION") || [];
+        const consultTotal = consultItems.reduce((sum: number, li: any) => sum + (li.total || 0), 0);
+
+        if (consultTotal > 0) {
+          const nonConsultTotal = (inv.lineItems || [])
+            .filter((li: any) => (li.department || "").toUpperCase() !== "CONSULTATION")
+            .reduce((sum: number, li: any) => sum + (li.total || 0), 0);
+
+          // Extract all completed refunds on this invoice
+          const allRefunds: any[] = [];
+          (inv.payments || []).forEach((p: any) => {
+            (p.refunds || []).forEach((r: any) => {
+              if (r.status === "COMPLETED") allRefunds.push(r);
+            });
+          });
+
+          let consultRefundAmount = 0;
+
+          for (const r of allRefunds) {
+            const reason = (r.reason || "").toLowerCase();
+            const isExplicitConsultRefund =
+              reason.includes("consult") ||
+              reason.includes("doctor") ||
+              reason.includes("appointment") ||
+              reason.includes("booking");
+
+            const isExplicitNonConsultRefund =
+              reason.includes("lab") ||
+              reason.includes("pharmacy") ||
+              reason.includes("medicine") ||
+              reason.includes("drug") ||
+              reason.includes("extra") ||
+              reason.includes("test");
+
+            if (isExplicitConsultRefund) {
+              consultRefundAmount += r.amount;
+            } else if (!isExplicitNonConsultRefund) {
+              // Generic refund: absorb non-consultation charges first
+              const excessRefund = Math.max(0, r.amount - nonConsultTotal);
+              consultRefundAmount += excessRefund;
+            }
+          }
+
+          const netRevenue = Math.max(0, Math.round((consultTotal - consultRefundAmount) * 100) / 100);
+
+          if (netRevenue > 0) {
+            totalCollected += netRevenue;
+            totalConsultations += 1;
+          }
         }
       }
 
@@ -191,8 +247,12 @@ export const generateDoctorStatements = async (req: Request, res: Response) => {
   }
 };
 
-// PATCH /api/finance/doctor-statements/:id/status
+/**
+ * @deprecated Legacy doctor settlement status update. Use Fund Office daily sheet disbursement.
+ * PATCH /api/finance/doctor-statements/:id/status
+ */
 export const updateDoctorStatementStatus = async (req: Request, res: Response) => {
+  res.setHeader("Warning", '299 - "DoctorPaymentStatement is legacy. Use Fund Office DoctorDailySheet as canonical doctor settlement system."');
   try {
     const id = String(req.params.id);
     const { status, paymentMethod, paymentReference, remarks } = req.body;

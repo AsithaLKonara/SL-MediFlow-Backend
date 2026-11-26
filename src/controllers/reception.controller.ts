@@ -7,8 +7,14 @@ import { websocketService } from "../services/websocket.service.js";
 import { SMSService } from "../services/sms.service.js";
 import { generateMRN } from "../utils/mrn.util.js";
 import { generateIdentityKey } from "../utils/identity.util.js";
-import { getTimezoneBoundaries } from "../lib/dateUtils.js";
-import { sortDoctorsWithOpdFirst } from "../utils/doctor-utils.js";
+import { getTimezoneBoundaries, parseAgeString, calculateDobAndFallback, formatPatientAge } from "../lib/dateUtils.js";
+import { sortDoctorsWithOpdFirst, isOpdDoctor } from "../utils/doctor-utils.js";
+import { recordDoctorShareOnPayment } from "./fund-office.controller.js";
+import { pharmacyService } from "../services/pharmacy.service.js";
+import { clearCache } from "../middlewares/cache.middleware.js";
+import { FrontdeskService } from "../services/frontdesk.service.js";
+
+const frontdeskService = new FrontdeskService();
 
 export const openShift = async (req: Request, res: Response) => {
   try {
@@ -60,8 +66,7 @@ export const getCurrentShift = async (req: Request, res: Response) => {
 
     if (roleName === "nurse") {
       // Nurse shifts are strictly linked to daily biometric/attendance clock-in, not cash registers
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay: today } = getTimezoneBoundaries();
 
       const attendance = await prisma.staffAttendance.findUnique({
         where: {
@@ -139,7 +144,11 @@ export const getPatients = async (req: Request, res: Response) => {
         take: 50,
         orderBy: { createdAt: 'desc' }
       });
-      return res.json({ success: true, data: recentPatients });
+      const formatted = recentPatients.map(p => ({
+        ...p,
+        patientAge: formatPatientAge(p.dateOfBirth, p.ageFallback)
+      }));
+      return res.json({ success: true, data: formatted });
     }
     
     const searchTerm = (q as string).trim();
@@ -157,7 +166,11 @@ export const getPatients = async (req: Request, res: Response) => {
       orderBy: { createdAt: 'desc' }
     });
     
-    res.json({ success: true, data: patients });
+    const formatted = patients.map(p => ({
+      ...p,
+      patientAge: formatPatientAge(p.dateOfBirth, p.ageFallback)
+    }));
+    res.json({ success: true, data: formatted });
   } catch (error: any) {
     console.error("Error fetching patients:", error);
     res.status(500).json({ success: false, error: error.message });
@@ -166,11 +179,7 @@ export const getPatients = async (req: Request, res: Response) => {
 
 export const getMetrics = async (req: Request, res: Response) => {
   try {
-    const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     // 1. Registered Today
     const registeredToday = await prisma.patient.count({
@@ -275,7 +284,10 @@ export const getPatientById = async (req: Request, res: Response): Promise<void>
           orderBy: { createdAt: "desc" }
         },
         LabRequests: {
-          include: { items: { include: { LabTest: true } } },
+          include: { 
+            items: { include: { LabTest: true } },
+            results: true
+          },
           orderBy: { requestedAt: "desc" }
         }
       }
@@ -294,12 +306,18 @@ export const getPatientById = async (req: Request, res: Response): Promise<void>
       medications: p.items.map(i => i.drugName)
     }));
 
-    const labResults = patient.LabRequests.map(l => ({
-      id: l.id,
-      date: l.requestedAt,
-      status: l.status,
-      tests: l.items.map(i => i.LabTest.name)
-    }));
+    const labResults = patient.LabRequests
+      .filter(l => l.status !== "CANCELLED")
+      .map(l => ({
+        id: l.id,
+        date: l.requestedAt,
+        status: l.status,
+        priority: l.priority,
+        tests: l.items.map(i => i.LabTest.name),
+        testIds: l.items.map(i => i.labTestId),
+        reportUrl: l.reportUrl || (l.status === "COMPLETED" ? `/reports/${l.id.slice(0, 8).toUpperCase()}` : null),
+        results: (l as any).results || []
+      }));
     
     // Map to the frontend expected format
     res.json({
@@ -334,9 +352,12 @@ export const generateToken = async (req: Request, res: Response) => {
       patientName, 
       patientPhone, 
       ageFallback, 
+      age,
       doctorId, 
       sessionId: requestedSessionId,
       doctorName, 
+      isUpfront: requestedIsUpfront,
+      doctorFee: requestedDoctorFee,
       testIds, 
       customLabPrices, 
       serviceIds, 
@@ -345,8 +366,36 @@ export const generateToken = async (req: Request, res: Response) => {
       labTokenNumber, 
       serviceTokenNumber, 
       date, 
-      bookingType 
+      bookingType,
+      roomId: requestedRoomId,
+      roomNumber: requestedRoomNumber 
     } = req.body;
+
+    const rawAgeInput = age !== undefined && age !== null && age !== "" ? age : ageFallback;
+
+    const hasNoPhone = Boolean(req.body.noPhone);
+    const rawPhone = patientPhone ? String(patientPhone).trim() : "";
+    const isSystemGenerated = !rawPhone || 
+      rawPhone.startsWith('WALKIN') || 
+      rawPhone.startsWith('NO-PHONE') || 
+      rawPhone.startsWith('NO_PHONE');
+    const effectivePhone = rawPhone 
+      ? rawPhone 
+      : (hasNoPhone ? `WALKIN-${Date.now().toString().slice(-6)}-${Math.random().toString(36).substring(2, 5).toUpperCase()}` : "");
+
+    // Validate mandatory POS patient fields: Name, Phone, Age
+    if (!requestedPatientId) {
+      if (!patientName || !String(patientName).trim()) {
+        return res.status(400).json({ success: false, error: "Patient Name is mandatory for token generation." });
+      }
+      if (!effectivePhone) {
+        return res.status(400).json({ success: false, error: "Patient Phone Number is mandatory for token generation." });
+      }
+      const parsedAge = parseAgeString(rawAgeInput);
+      if (!parsedAge.valid) {
+        return res.status(400).json({ success: false, error: parsedAge.error || "Valid Patient Age (1-130) is mandatory for token generation." });
+      }
+    }
 
     // Multi-tenant patient resolution
     let patient: any = null;
@@ -356,16 +405,16 @@ export const generateToken = async (req: Request, res: Response) => {
       patient = await prisma.patient.findUnique({ where: { id: requestedPatientId } });
     }
 
-    // 2. Composite lookup if not explicitly flagged as new patient
-    if (!patient && !isNewPatient && patientName && patientPhone) {
-      const identityKey = generateIdentityKey(patientName, patientPhone);
+    // 2. Composite lookup if not explicitly flagged as new patient and not a systematic fallback code
+    if (!patient && !isNewPatient && !isSystemGenerated && patientName && effectivePhone) {
+      const identityKey = generateIdentityKey(patientName, effectivePhone);
       if (identityKey) {
         patient = await prisma.patient.findUnique({ where: { identityKey } });
       }
       if (!patient) {
         patient = await prisma.patient.findFirst({
           where: {
-            phone: patientPhone,
+            phone: effectivePhone,
             fullName: { equals: patientName, mode: "insensitive" }
           }
         });
@@ -376,8 +425,8 @@ export const generateToken = async (req: Request, res: Response) => {
     if (!patient) {
       const patientId = await generateMRN(prisma);
       const effectiveName = patientName || "Walk-in Patient";
-      const effectivePhone = patientPhone || `WALKIN-${randomUUID()}`;
-      let identityKey = generateIdentityKey(effectiveName, effectivePhone);
+      const finalPhone = effectivePhone || `WALKIN-${randomUUID()}`;
+      let identityKey = isSystemGenerated ? null : generateIdentityKey(effectiveName, finalPhone);
 
       // Handle rare key collision
       if (identityKey) {
@@ -387,19 +436,26 @@ export const generateToken = async (req: Request, res: Response) => {
         }
       }
 
+      const targetDate = date ? new Date(date) : new Date();
+      const parsedAge = parseAgeString(rawAgeInput);
+      const { dob, ageFallback: computedFallback } = parsedAge.valid
+        ? calculateDobAndFallback(parsedAge, targetDate)
+        : { dob: null, ageFallback: ageFallback ? parseInt(ageFallback.toString(), 10) : null };
+
       patient = await prisma.patient.create({
         data: {
           patientId,
           identityKey: identityKey || null,
           fullName: effectiveName,
-          phone: effectivePhone,
-          ageFallback: ageFallback ? parseInt(ageFallback.toString(), 10) : null,
+          phone: finalPhone,
+          dateOfBirth: dob,
+          ageFallback: computedFallback,
           gender: gender || null
         }
       });
       
-      if (patientPhone && !patientPhone.startsWith('WALKIN')) {
-        SMSService.syncContact(patientPhone, patient.fullName).catch(console.error);
+      if (!isSystemGenerated) {
+        SMSService.syncContact(finalPhone, patient.fullName).catch(console.error);
       }
     }
 
@@ -409,9 +465,10 @@ export const generateToken = async (req: Request, res: Response) => {
 
     // --- Billing Logic ---
     let doctorDetails = null;
-    let doctorRoomNumber = null;
+    let doctorRoomNumber = requestedRoomNumber || null;
+    let doctorRoomId = requestedRoomId || null;
     if (doctorId) {
-      doctorDetails = await prisma.user.findUnique({ where: { id: doctorId }, include: { room: true } });
+      doctorDetails = await prisma.user.findUnique({ where: { id: doctorId }, include: { room: true, Department: true } });
       const targetDate = date ? new Date(date) : new Date();
       const { startOfDay, endOfDay, dayOfWeek } = getTimezoneBoundaries(targetDate);
       const todayAttendance = await prisma.doctorAttendance.findFirst({
@@ -444,7 +501,17 @@ export const generateToken = async (req: Request, res: Response) => {
         });
       }
 
-      doctorRoomNumber = todayAttendance?.room?.roomNumber || session?.room?.roomNumber || doctorDetails?.room?.roomNumber || null;
+      doctorRoomNumber = todayAttendance?.room?.roomNumber 
+        || session?.room?.roomNumber 
+        || doctorDetails?.room?.roomNumber 
+        || requestedRoomNumber 
+        || null;
+
+      doctorRoomId = todayAttendance?.roomId 
+        || session?.roomId 
+        || doctorDetails?.roomId 
+        || requestedRoomId 
+        || null;
     }
     
     let labTestsDetails: any[] = [];
@@ -463,8 +530,18 @@ export const generateToken = async (req: Request, res: Response) => {
       });
     }
 
-    const isNonOPD = doctorDetails && doctorDetails.specialty && doctorDetails.specialty !== "General" && doctorDetails.specialty.toUpperCase() !== "OPD";
-    const needsInvoice = isNonOPD || hasLab || hasService;
+    const isNonOPD = Boolean(doctorDetails && doctorDetails.specialty && doctorDetails.specialty !== "General" && doctorDetails.specialty.toUpperCase() !== "OPD");
+    const isPostPayDoctor = doctorDetails?.feeType === "POST" || doctorDetails?.feeType === "POST_PAY" || requestedIsUpfront === false;
+    const isUpfrontConsultation = Boolean(
+      hasConsultation &&
+      !isPostPayDoctor &&
+      (
+        requestedIsUpfront === true ||
+        doctorDetails?.feeType === "UPFRONT" ||
+        (requestedDoctorFee !== undefined && Number(requestedDoctorFee) > 0 && requestedIsUpfront !== false)
+      )
+    );
+    const needsInvoice = isUpfrontConsultation || hasLab || hasService;
 
     let sharedRefNo = Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
@@ -699,9 +776,9 @@ export const generateToken = async (req: Request, res: Response) => {
       tokensToGenerate.push({
         dept: "CONSULTATION",
         docId: doctorId,
-        roomId: doctorDetails?.roomId || null,
+        roomId: doctorRoomId,
         prefix: "",
-        name: doctorName || "General Physician",
+        name: doctorName || doctorDetails?.fullName || "General Physician",
         roomNumber: doctorRoomNumber,
         requestedTokenNumber: doctorTokenNumber
       });
@@ -786,6 +863,11 @@ export const generateToken = async (req: Request, res: Response) => {
     const generatedTokens = [];
     for (const t of tokensToGenerate) {
       const token = await generateSpecificToken(t.dept, t.docId, t.roomId, t.prefix, t.requestedTokenNumber);
+      const patientAge = formatPatientAge(
+        patient?.dateOfBirth, 
+        patient?.ageFallback !== null && patient?.ageFallback !== undefined ? patient.ageFallback : (ageFallback ? parseInt(ageFallback.toString(), 10) : null)
+      );
+
       generatedTokens.push({
         id: token.id,
         refNo: token.bookingReference,
@@ -794,6 +876,7 @@ export const generateToken = async (req: Request, res: Response) => {
         status: token.status,
         doctorName: t.name,
         patientName: patient.fullName,
+        patientAge: patientAge,
         appointmentDate: token.appointmentDate,
         roomId: t.roomId,
         roomNumber: t.roomNumber,
@@ -808,19 +891,23 @@ export const generateToken = async (req: Request, res: Response) => {
       const lineItems = [];
       let totalAmount = 0;
 
-      if (isNonOPD && doctorDetails?.feeType === "UPFRONT") {
-        const fee = doctorDetails.consultationFee || 2500;
+      if (isUpfrontConsultation) {
+        const fee = (requestedDoctorFee !== undefined && Number(requestedDoctorFee) > 0)
+          ? Number(requestedDoctorFee)
+          : (doctorDetails?.consultationFee || 2500);
+        const description = isNonOPD
+          ? `Specialist Consultation (Upfront) - ${doctorName || doctorDetails?.fullName || "Doctor"}`
+          : `Consultation - Dr. ${doctorDetails?.fullName || doctorName || "Doctor"}`;
         lineItems.push({
           department: "CONSULTATION",
-          description: `Specialist Consultation (Upfront) - ${doctorName}`,
+          referenceId: doctorId || undefined,
+          description: description,
           quantity: 1,
           unitPrice: fee,
           total: fee
         });
         totalAmount = Math.round((totalAmount + fee) * 100) / 100;
       }
-
-
 
       if (hasService) {
         extraServicesDetails.forEach(svc => {
@@ -909,23 +996,50 @@ export const generateToken = async (req: Request, res: Response) => {
       }
     }
 
-    if (patientPhone && !patientPhone.startsWith('WALKIN')) {
-      const masterBookingRef = generatedTokens[0]?.refNo || (typeof sharedRefNo !== 'undefined' ? sharedRefNo : 'N/A');
-      const formattedApptDate = (date ? new Date(date) : new Date()).toLocaleDateString('en-GB');
+    const isPhoneSystemGenerated = !patientPhone || 
+      patientPhone.startsWith('WALKIN') || 
+      patientPhone.startsWith('NO-PHONE') || 
+      patientPhone.startsWith('NO_PHONE');
 
-      const { templateName, variables } = SMSService.buildVisitTokenNotification(
-        patient.fullName,
-        formattedApptDate,
-        masterBookingRef,
-        generatedTokens
-      );
+    if (patientPhone && !isPhoneSystemGenerated) {
+      const isOpd = hasConsultation && doctorDetails && isOpdDoctor(doctorDetails);
 
-      await NotificationService.sendTemplatedSMS(
-        patient.id,
-        patientPhone,
-        templateName,
-        variables
-      ).catch(console.error);
+      if (isOpd) {
+        // Clinical Requirement: OPD Doctor sends SMS bills ONLY. Suppress booking confirmation SMS.
+        // If an invoice was created and paid upfront, send the OPD Bill Receipt SMS.
+        if (invoiceData && invoiceData.status === 'PAID') {
+          const doctorNameStr = doctorDetails?.fullName || doctorName || 'OPD Doctor';
+          const primaryTokenNum = generatedTokens[0]?.tokenNumber || generatedTokens[0]?.refNo || '-';
+          const billRefStr = (invoiceData as any)?.invoiceNumber || generatedTokens[0]?.refNo || (invoiceData ? `INV-${invoiceData.id.slice(0, 8).toUpperCase()}` : 'N/A');
+          await NotificationService.sendOpdBillSMS({
+            patientId: patient.id,
+            phone: patientPhone,
+            patientName: patient.fullName,
+            doctorName: doctorNameStr,
+            tokenNumber: primaryTokenNum,
+            totalAmount: invoiceData.totalAmount,
+            billRef: billRefStr
+          }).catch(console.error);
+        }
+      } else {
+        // Specialist / Visiting Consultant / Non-OPD visit: Send standard booking confirmation SMS
+        const masterBookingRef = generatedTokens[0]?.refNo || (typeof sharedRefNo !== 'undefined' ? sharedRefNo : 'N/A');
+        const formattedApptDate = (date ? new Date(date) : new Date()).toLocaleDateString('en-GB');
+
+        const { templateName, variables } = SMSService.buildVisitTokenNotification(
+          patient.fullName,
+          formattedApptDate,
+          masterBookingRef,
+          generatedTokens
+        );
+
+        await NotificationService.sendTemplatedSMS(
+          patient.id,
+          patientPhone,
+          templateName,
+          variables
+        ).catch(console.error);
+      }
     }
 
     if (hasConsultation && typeof doctorId === 'string') {
@@ -936,11 +1050,13 @@ export const generateToken = async (req: Request, res: Response) => {
       } catch (e) {}
     }
 
-    if (websocketService.getIo()) {
-      generatedTokens.forEach(t => {
-        websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: t.id });
-      });
-    }
+    try {
+      if (websocketService.getIo()) {
+        generatedTokens.forEach(t => {
+          websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: t.id });
+        });
+      }
+    } catch (e) {}
 
     res.status(201).json({
       success: true,
@@ -958,61 +1074,31 @@ export const generateToken = async (req: Request, res: Response) => {
 export const markDoctorArrived = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { roomId, startTime, endTime } = req.body;
+    const { roomId, startTime, endTime, ignoreConflict, override } = req.body;
 
     if (!roomId || roomId.trim() === "") {
       return res.status(400).json({ success: false, error: "Room is mandatory" });
     }
 
-    
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const userId = (req as any).user?.id || (id as string);
+    const data = await frontdeskService.updateDoctorAttendance(
+      id as string,
+      "ARRIVED",
+      roomId,
+      userId,
+      false,
+      undefined,
+      startTime,
+      endTime,
+      ignoreConflict === true,
+      override === true
+    );
 
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-
-    // Find if there's already an attendance record for today
-    let attendance = await prisma.doctorAttendance.findFirst({
-      where: {
-        doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
-      }
-    });
-
-    if (attendance) {
-      attendance = await prisma.doctorAttendance.update({
-        where: { id: attendance.id },
-        data: {
-          status: "ARRIVED",
-          roomId: roomId || null,
-          arrivedAt: attendance.arrivedAt || new Date(),
-          expectedStartTime: startTime || attendance.expectedStartTime,
-          expectedEndTime: endTime || attendance.expectedEndTime
-        }
-      });
-    } else {
-      attendance = await prisma.doctorAttendance.create({
-        data: {
-          doctorId: id as string,
-          date: today,
-          status: "ARRIVED",
-          roomId: roomId || null,
-          arrivedAt: new Date(),
-          expectedStartTime: startTime || null,
-          expectedEndTime: endTime || null
-        }
-      });
-    }
-    
-    // Trigger SMS to waiting patients
-    try {
-      await NotificationService.triggerDoctorArrived(id as string, today);
-    } catch (e) {
-      console.error("Failed to send doctor arrived SMS notifications:", e);
-    }
-    
-    res.json({ success: true, data: attendance });
+    res.json({ success: true, data });
   } catch (error: any) {
+    if (error.conflict) {
+      return res.status(409).json(error.conflictData || { conflict: true, error: error.message });
+    }
     console.error("Error marking doctor arrived:", error);
     res.status(500).json({ success: false, error: error.message });
   }
@@ -1021,41 +1107,18 @@ export const markDoctorArrived = async (req: Request, res: Response) => {
 export const markDoctorOut = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { outTime } = req.body;
-    
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const { forceExit } = req.body;
+    const userId = (req as any).user?.id || (id as string);
 
-    const attendance = await prisma.doctorAttendance.findFirst({
-      where: {
-        doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
-      }
-    });
+    const data = await frontdeskService.updateDoctorAttendance(
+      id as string,
+      "LEFT",
+      null,
+      userId,
+      forceExit === true
+    );
 
-    if (!attendance) {
-      return res.status(404).json({ success: false, error: "No arrival record found for today" });
-    }
-
-    let leftAt = new Date();
-    if (outTime) {
-      // outTime is expected to be "HH:MM"
-      const [hours, minutes] = outTime.split(':');
-      leftAt = new Date();
-      leftAt.setHours(parseInt(hours, 10), parseInt(minutes, 10), 0, 0);
-    }
-
-    const updated = await prisma.doctorAttendance.update({
-      where: { id: attendance.id },
-      data: {
-        status: "LEFT",
-        leftAt
-      }
-    });
-    
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data });
   } catch (error: any) {
     console.error("Error marking doctor out:", error);
     res.status(500).json({ success: false, error: error.message });
@@ -1069,15 +1132,12 @@ export const updateShiftPeriod = async (req: Request, res: Response) => {
     const { id } = req.params;
     const { startTime, endTime } = req.body;
     
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
+    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
 
     const attendance = await prisma.doctorAttendance.findFirst({
       where: {
         doctorId: id as string,
-        date: { gte: today, lt: tomorrow }
+        date: { gte: today, lte: endOfDay }
       }
     });
 
@@ -1110,14 +1170,14 @@ export const updateShiftPeriod = async (req: Request, res: Response) => {
 
 export const checkoutAppointment = async (req: Request, res: Response) => {
   try {
-    const { appointmentId, fee, isUpfront, discount } = req.body;
+    const { appointmentId, fee, isUpfront, discount, addedLabTestIds, addedExtraServiceIds } = req.body;
     if (!appointmentId) {
       return res.status(400).json({ success: false, error: "appointmentId is required" });
     }
 
     const appointment = await prisma.appointment.findUnique({
       where: { id: appointmentId },
-      include: { Patient: true, User: true }
+      include: { Patient: true, User: { include: { Department: true } } }
     });
 
     if (!appointment) {
@@ -1177,6 +1237,153 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
     let mergedInvoice: any = null;
 
     await prisma.$transaction(async (tx) => {
+      const { startOfDay, endOfDay } = getTimezoneBoundaries();
+
+      // --- 1. Handle newly added Lab Tests on checkout ---
+      const addedLineItems: any[] = [];
+      if (addedLabTestIds && Array.isArray(addedLabTestIds) && addedLabTestIds.length > 0) {
+        const labTests = await tx.labTest.findMany({
+          where: { id: { in: addedLabTestIds } },
+          include: { room: true }
+        });
+
+        if (labTests.length > 0) {
+          const labRooms = await tx.room.findMany({
+            where: { department: "LAB", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultLabRoom = labRooms[0] || null;
+
+          const labGroups = new Map<string, { roomId: string | null; roomNumber: string; testIds: string[] }>();
+          for (const t of labTests) {
+            const assignedRoom = t.room || labRooms.find((r: any) => r.id === t.roomId) || defaultLabRoom;
+            const rId = assignedRoom?.id || "default-lab";
+            const rNum = assignedRoom?.roomNumber || "LAB-A";
+            if (!labGroups.has(rId)) {
+              labGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, testIds: [] });
+            }
+            labGroups.get(rId)!.testIds.push(t.id);
+            const desc = t.isOutsideTest
+              ? `Lab Test (Outsourced - ${t.outsourcedCenter || "Partner"}): ${t.name}`
+              : `Lab Test: ${t.name}`;
+            addedLineItems.push({
+              description: desc,
+              referenceId: t.id,
+              quantity: 1,
+              unitPrice: Number(t.price) || 0,
+              total: Number(t.price) || 0,
+              department: "LAB"
+            });
+          }
+
+          // Generate room-partitioned tokens and appointments
+          for (const [_, grp] of labGroups.entries()) {
+            const isLabA = grp.roomNumber.toUpperCase().includes("A");
+            const isLabB = grp.roomNumber.toUpperCase().includes("B");
+            const prefix = isLabA ? "LA" : isLabB ? "LB" : "LAB";
+
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "LAB",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, '0')}`;
+
+            const labAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: appointment.patientId,
+                department: "LAB",
+                status: "WAITING_FOR_LAB_TEST",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: appointment.bookingReference
+              }
+            });
+            allApptIds.push(labAppt.id);
+          }
+
+          // Create LabRequest
+          await tx.labRequest.create({
+            data: {
+              patientId: appointment.patientId,
+              visitId: appointment.id,
+              priority: "ROUTINE",
+              status: "PENDING",
+              items: {
+                create: labTests.map((t: any) => ({
+                  labTestId: t.id,
+                  price: Number(t.price) || 0
+                }))
+              }
+            }
+          });
+        }
+      }
+
+      // --- 2. Handle newly added Extra Services on checkout ---
+      if (addedExtraServiceIds && Array.isArray(addedExtraServiceIds) && addedExtraServiceIds.length > 0) {
+        const extraServices = await tx.extraService.findMany({
+          where: { id: { in: addedExtraServiceIds } },
+          include: { room: true }
+        });
+
+        if (extraServices.length > 0) {
+          const serviceRooms = await tx.room.findMany({
+            where: { department: "EXTRA_SERVICE", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultServiceRoom = serviceRooms[0] || null;
+
+          const serviceGroups = new Map<string, { roomId: string | null; roomNumber: string; serviceIds: string[] }>();
+          for (const s of extraServices) {
+            const assignedRoom = s.room || serviceRooms.find((r: any) => r.id === s.roomId) || defaultServiceRoom;
+            const rId = assignedRoom?.id || "default-es";
+            const rNum = assignedRoom?.roomNumber || "EXT-01";
+            if (!serviceGroups.has(rId)) {
+              serviceGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, serviceIds: [] });
+            }
+            serviceGroups.get(rId)!.serviceIds.push(s.id);
+            addedLineItems.push({
+              description: `Service: ${s.title}`,
+              quantity: 1,
+              unitPrice: Number(s.price) || 0,
+              total: Number(s.price) || 0,
+              department: "EXTRA_SERVICE"
+            });
+          }
+
+          for (const [_, grp] of serviceGroups.entries()) {
+            const prefix = grp.roomNumber.toUpperCase().includes("ECG") ? "ECG" : "EXT";
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "EXTRA_SERVICE",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, '0')}`;
+
+            const serviceAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: appointment.patientId,
+                department: "EXTRA_SERVICE",
+                status: "WAITING",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: appointment.bookingReference
+              }
+            });
+            allApptIds.push(serviceAppt.id);
+          }
+        }
+      }
+
       let invoices = await tx.invoice.findMany({
         where: {
           visitId: { in: allVisitIdentifiers },
@@ -1210,6 +1417,18 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
       const willCreateConsultInvoice = !existingConsultPaid && !hasConsultInDraftInvoices && numericFee > 0;
 
       if (invoices.length > 0) {
+        // If there are added line items, append to first draft invoice
+        if (addedLineItems.length > 0 && invoices[0]) {
+          const targetInv = invoices[0];
+          await tx.invoiceLineItem.createMany({
+            data: addedLineItems.map(item => ({ ...item, invoiceId: targetInv.id }))
+          });
+          const addedSum = addedLineItems.reduce((acc, item) => acc + item.total, 0);
+          targetInv.subtotal += addedSum;
+          targetInv.totalAmount += addedSum;
+          targetInv.lineItems.push(...addedLineItems);
+        }
+
         // Pay all existing DRAFT invoices
         for (const inv of invoices) {
           const isConsultationInv = inv.lineItems?.some((li: any) => li.department === "CONSULTATION");
@@ -1262,17 +1481,20 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
         const consultApptId = availableApptIdForPayment;
         availableApptIdForPayment = null;
 
-        // Create a new paid invoice for consultation (upfront or post-pay)
+        const addedSum = invoices.length === 0 ? addedLineItems.reduce((acc, item) => acc + item.total, 0) : 0;
+        const consultTotal = numericFee + addedSum;
+
+        // Create a new paid invoice for consultation (and added services if no draft invoices existed)
         const consultInvoice = await tx.invoice.create({
           data: {
             visitId: appointment.id,
             patientId: appointment.patientId,
-            subtotal: numericFee,
-            totalAmount: numericFee,
+            subtotal: consultTotal,
+            totalAmount: consultTotal,
             status: "PAID",
             payments: {
               create: [{
-                amount: numericFee,
+                amount: consultTotal,
                 method: req.body.paymentMethod || "CASH",
                 status: "COMPLETED", 
                 shiftId,
@@ -1287,7 +1509,8 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
                   unitPrice: numericFee,
                   total: numericFee,
                   department: "CONSULTATION"
-                }
+                },
+                ...(invoices.length === 0 ? addedLineItems : [])
               ]
             }
           },
@@ -1300,26 +1523,84 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
           mergedInvoice.totalAmount += consultInvoice.totalAmount;
           mergedInvoice.lineItems.push(...consultInvoice.lineItems);
         }
+      } else if (invoices.length === 0 && addedLineItems.length > 0) {
+        // No consultation invoice and no draft invoices, but services were added on checkout
+        const addedSum = addedLineItems.reduce((acc, item) => acc + item.total, 0);
+        const addedInvoice = await tx.invoice.create({
+          data: {
+            visitId: appointment.id,
+            patientId: appointment.patientId,
+            subtotal: addedSum,
+            totalAmount: addedSum,
+            status: "PAID",
+            payments: {
+              create: [{
+                amount: addedSum,
+                method: req.body.paymentMethod || "CASH",
+                status: "COMPLETED", 
+                shiftId
+              }]
+            },
+            lineItems: {
+              create: addedLineItems
+            }
+          },
+          include: { lineItems: true }
+        });
+
+        if (!mergedInvoice) {
+          mergedInvoice = addedInvoice;
+        } else {
+          mergedInvoice.totalAmount += addedInvoice.totalAmount;
+          mergedInvoice.lineItems.push(...addedInvoice.lineItems);
+        }
       }
     }, { timeout: 15000, maxWait: 5000 });
 
-    if (websocketService.getIo()) {
-      websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: appointmentId });
+    if (mergedInvoice?.id) {
+      recordDoctorShareOnPayment(mergedInvoice.id).catch((err) =>
+        console.error("Error auto-recording doctor share on reception payment:", err)
+      );
+    }
+
+    try {
+      if (websocketService.getIo()) {
+        websocketService.getIo().emit("TOKEN_STATUS_UPDATED", { tokenId: appointmentId });
+      }
+    } catch (e) {}
+
+    // Clinical Rule: OPD doctor sends SMS bills ONLY upon payment/checkout.
+    const isApptPatientSystemPhone = !appointment.Patient?.phone ||
+      appointment.Patient.phone.startsWith('WALKIN') ||
+      appointment.Patient.phone.startsWith('NO-PHONE') ||
+      appointment.Patient.phone.startsWith('NO_PHONE');
+
+    if (appointment.Patient?.phone && !isApptPatientSystemPhone) {
+      const isOpd = isOpdDoctor(appointment.User);
+      if (isOpd && mergedInvoice && Number(mergedInvoice.totalAmount) > 0) {
+        const docName = appointment.User?.fullName || 'OPD Doctor';
+        const billRef = (mergedInvoice as any)?.invoiceNumber || appointment.bookingReference || `INV-${mergedInvoice.id.slice(0, 8).toUpperCase()}`;
+        NotificationService.sendOpdBillSMS({
+          patientId: appointment.patientId,
+          phone: appointment.Patient.phone,
+          patientName: appointment.Patient.fullName,
+          doctorName: docName,
+          tokenNumber: appointment.tokenNumber,
+          totalAmount: mergedInvoice.totalAmount,
+          billRef
+        }).catch(console.error);
+      }
     }
 
     let allTokens = await prisma.appointment.findMany({
       where: { id: { in: allApptIds } },
-      include: { Patient: true, User: { include: { room: true } } }
+      include: { Patient: true, User: { include: { room: true } }, room: true }
     });
 
-    const targetDate = new Date();
-    const startOfDay = new Date(targetDate);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(targetDate);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
 
     allTokens = await Promise.all(allTokens.map(async (t) => {
-      let roomNumber = t.User?.room?.roomNumber || null;
+      let roomNumber = t.room?.roomNumber || t.User?.room?.roomNumber || null;
       if (t.doctorId) {
         const attendance = await prisma.doctorAttendance.findFirst({
           where: { doctorId: t.doctorId, date: { gte: startOfDay, lte: endOfDay } },
@@ -1329,7 +1610,15 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
           roomNumber = attendance.room.roomNumber;
         }
       }
-      return { ...t, roomNumber };
+      const patientAge = formatPatientAge(t.Patient?.dateOfBirth, t.Patient?.ageFallback);
+
+      return { 
+        ...t, 
+        roomNumber, 
+        patientAge,
+        doctorName: t.User?.fullName || (t as any).doctorName || "General",
+        patientName: t.Patient?.fullName || (t as any).patientName || "Walk-in Patient"
+      };
     })) as any;
 
     res.json({
@@ -1347,6 +1636,342 @@ export const checkoutAppointment = async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error("Error checking out appointment:", error);
     res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+export const posDirectSale = async (req: Request, res: Response) => {
+  try {
+    const {
+      patientId: requestedPatientId,
+      patientName,
+      patientPhone,
+      patientAge,
+      paymentMethod = "CASH",
+      discount,
+      items,
+      notes
+    } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ success: false, error: "Cart items are required for direct sale" });
+    }
+
+    const { startOfDay, endOfDay } = getTimezoneBoundaries();
+
+    // 1. Resolve or create Patient
+    let patient: any = null;
+    if (requestedPatientId) {
+      patient = await prisma.patient.findUnique({ where: { id: requestedPatientId } });
+    }
+
+    if (!patient && patientPhone) {
+      patient = await prisma.patient.findFirst({
+        where: { phone: patientPhone.trim() }
+      });
+    }
+
+    if (!patient) {
+      const cleanName = (patientName || "Walk-in Patient").trim();
+      const cleanPhone = (patientPhone || "0000000000").trim();
+      const count = await prisma.patient.count();
+      const generatedPatientId = `PAT-${String(count + 1).padStart(5, "0")}`;
+
+      patient = await prisma.patient.create({
+        data: {
+          patientId: generatedPatientId,
+          fullName: cleanName,
+          phone: cleanPhone,
+          ageFallback: patientAge ? parseInt(patientAge.toString(), 10) : null,
+          gender: "OTHER",
+          isActive: true
+        }
+      });
+    }
+
+    const bookingRef = Math.floor(1000000000 + Math.random() * 9000000000).toString();
+    const generatedTokens: any[] = [];
+    let createdLabRequest: any = null;
+
+    const result = await prisma.$transaction(async (tx) => {
+      const labItems = items.filter((i: any) => i.department === "LAB");
+      const serviceItems = items.filter((i: any) => i.department === "EXTRA_SERVICE");
+      const medicineItems = items.filter((i: any) => i.department === "PHARMACY" || i.isMedicine);
+
+      // --- A. Process Lab Tests ---
+      if (labItems.length > 0) {
+        const labTests = await tx.labTest.findMany({
+          where: { id: { in: labItems.map((i: any) => i.id) } },
+          include: { room: true }
+        });
+
+        if (labTests.length > 0) {
+          const labRooms = await tx.room.findMany({
+            where: { department: "LAB", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultLabRoom = labRooms[0] || null;
+
+          const labGroups = new Map<string, { roomId: string | null; roomNumber: string; testIds: string[] }>();
+          for (const t of labTests) {
+            const assignedRoom = t.room || labRooms.find((r: any) => r.id === t.roomId) || defaultLabRoom;
+            const rId = assignedRoom?.id || "default-lab";
+            const rNum = assignedRoom?.roomNumber || "LAB-A";
+            if (!labGroups.has(rId)) {
+              labGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, testIds: [] });
+            }
+            labGroups.get(rId)!.testIds.push(t.id);
+          }
+
+          for (const [_, grp] of labGroups.entries()) {
+            const isLabA = grp.roomNumber.toUpperCase().includes("A");
+            const isLabB = grp.roomNumber.toUpperCase().includes("B");
+            const prefix = isLabA ? "LA" : isLabB ? "LB" : "LAB";
+
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "LAB",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, "0")}`;
+
+            const labAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: patient.id,
+                department: "LAB",
+                status: "WAITING_FOR_LAB_TEST",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: bookingRef
+              }
+            });
+
+            generatedTokens.push({
+              id: labAppt.id,
+              refNo: bookingRef,
+              tokenNumber: tokenDisplay,
+              department: "LAB",
+              status: labAppt.status,
+              patientName: patient.fullName,
+              roomNumber: grp.roomNumber,
+              appointmentDate: labAppt.appointmentDate
+            });
+          }
+
+          // Create LabRequest so LabTech portal sees the tests immediately
+          createdLabRequest = await tx.labRequest.create({
+            data: {
+              patientId: patient.id,
+              priority: "ROUTINE",
+              status: "PENDING",
+              items: {
+                create: labTests.map((t: any) => {
+                  const cartItem = labItems.find((i: any) => i.id === t.id);
+                  const price = cartItem ? Number(cartItem.price) : Number(t.price) || 0;
+                  return {
+                    labTestId: t.id,
+                    price
+                  };
+                })
+              }
+            },
+            include: { items: true }
+          });
+        }
+      }
+
+      // --- B. Process Extra Services ---
+      if (serviceItems.length > 0) {
+        const extraServices = await tx.extraService.findMany({
+          where: { id: { in: serviceItems.map((i: any) => i.id) } },
+          include: { room: true }
+        });
+
+        if (extraServices.length > 0) {
+          const serviceRooms = await tx.room.findMany({
+            where: { department: "EXTRA_SERVICE", isActive: true },
+            orderBy: { roomNumber: "asc" }
+          });
+          const defaultServiceRoom = serviceRooms[0] || null;
+
+          const serviceGroups = new Map<string, { roomId: string | null; roomNumber: string; serviceIds: string[] }>();
+          for (const s of extraServices) {
+            const assignedRoom = s.room || serviceRooms.find((r: any) => r.id === s.roomId) || defaultServiceRoom;
+            const rId = assignedRoom?.id || "default-es";
+            const rNum = assignedRoom?.roomNumber || "EXT-01";
+            if (!serviceGroups.has(rId)) {
+              serviceGroups.set(rId, { roomId: assignedRoom?.id || null, roomNumber: rNum, serviceIds: [] });
+            }
+            serviceGroups.get(rId)!.serviceIds.push(s.id);
+          }
+
+          for (const [_, grp] of serviceGroups.entries()) {
+            const prefix = grp.roomNumber.toUpperCase().includes("ECG") ? "ECG" : "EXT";
+
+            const countToday = await tx.appointment.count({
+              where: {
+                department: "EXTRA_SERVICE",
+                roomId: grp.roomId,
+                appointmentDate: { gte: startOfDay, lte: endOfDay }
+              }
+            });
+            const tokenDisplay = `${prefix}-${String(countToday + 1).padStart(2, "0")}`;
+
+            const serviceAppt = await tx.appointment.create({
+              data: {
+                tokenNumber: tokenDisplay,
+                patientId: patient.id,
+                department: "EXTRA_SERVICE",
+                status: "WAITING",
+                roomId: grp.roomId,
+                bookingType: "WALK_IN",
+                appointmentDate: startOfDay,
+                bookingReference: bookingRef
+              }
+            });
+
+            generatedTokens.push({
+              id: serviceAppt.id,
+              refNo: bookingRef,
+              tokenNumber: tokenDisplay,
+              department: "EXTRA_SERVICE",
+              status: serviceAppt.status,
+              patientName: patient.fullName,
+              roomNumber: grp.roomNumber,
+              appointmentDate: serviceAppt.appointmentDate
+            });
+          }
+        }
+      }
+
+      // --- C. Process Medicine Items (FIFO deduction) ---
+      for (const med of medicineItems) {
+        if (med.id) {
+          try {
+            let isSyrup = med.isSyrup;
+            if (isSyrup === undefined) {
+              const medRecord = await tx.medicine.findUnique({
+                where: { id: med.id },
+                select: { form: true, unit: true, packSize: true }
+              });
+              isSyrup = medRecord && (
+                ['syrup', 'suspension', 'liquid'].includes(medRecord.form?.trim().toLowerCase() || '') ||
+                (medRecord.unit?.trim().toLowerCase() === 'bottle' && (medRecord.packSize || 1) > 1)
+              );
+            }
+            const dispensedMl = isSyrup && (med.syrupVolumeMl || med.qty) ? Number(med.syrupVolumeMl || med.qty) : undefined;
+            await pharmacyService.dispenseMedicine(
+              med.id,
+              Number(med.qty) || 1,
+              { skipBilling: true },
+              tx,
+              dispensedMl
+            );
+          } catch (err: any) {
+            console.warn(`[posDirectSale] Dispense notice for medicine ${med.id}:`, err.message);
+          }
+        }
+      }
+
+      // --- D. Build Invoice Line Items ---
+      const lineItemsToCreate = items.map((item: any) => {
+        const qty = Number(item.qty) || 1;
+        const unitPrice = Number(item.price) || 0;
+        const total = Math.round(qty * unitPrice * 100) / 100;
+        let desc = item.name || "Item";
+        if (item.department === "LAB" && !desc.toLowerCase().includes("lab test")) {
+          desc = `Lab Test: ${desc}`;
+        } else if (item.department === "EXTRA_SERVICE" && !desc.toLowerCase().includes("service")) {
+          desc = `Service: ${desc}`;
+        } else if (item.isSyrup && item.syrupVolumeMl) {
+          desc = `${item.name} - ${item.syrupVolumeMl} ml @ LKR ${unitPrice.toFixed(2)}/ml`;
+        }
+
+        const dept = item.department || (item.isMedicine ? "PHARMACY" : "EXTRA_SERVICE");
+
+        return {
+          department: dept,
+          referenceId: item.id || undefined,
+          description: desc,
+          quantity: qty,
+          unitPrice,
+          total
+        };
+      });
+
+      const subtotal = Math.round(lineItemsToCreate.reduce((sum: number, li: any) => sum + li.total, 0) * 100) / 100;
+      const discountAmount = Math.max(0, Math.min(subtotal, Number(discount?.amount) || 0));
+      const finalAmount = Math.max(0, Math.round((subtotal - discountAmount) * 100) / 100);
+
+      const shiftId = await getOpenShiftId(((req as any).user)?.id, tx);
+
+      // --- E. Create Paid Invoice and Completed Payment ---
+      const invoice = await tx.invoice.create({
+        data: {
+          visitId: generatedTokens[0]?.id || bookingRef,
+          patientId: patient.id,
+          subtotal,
+          discountAmount,
+          discountType: discount?.type || null,
+          discountValue: discount?.value !== undefined ? Number(discount.value) : null,
+          discountReason: discount?.reason || null,
+          totalAmount: finalAmount,
+          status: "PAID",
+          lineItems: {
+            create: lineItemsToCreate
+          },
+          payments: {
+            create: [{
+              amount: finalAmount,
+              method: paymentMethod || "CASH",
+              status: "COMPLETED",
+              ...(shiftId ? { shiftId } : {})
+            }]
+          }
+        },
+        include: {
+          lineItems: true,
+          payments: true
+        }
+      });
+
+      return {
+        invoice,
+        tokens: generatedTokens,
+        labRequest: createdLabRequest,
+        bookingRef,
+        patient
+      };
+    }, { timeout: 20000, maxWait: 20000 });
+
+    // Announce payment success via WebSockets
+    websocketService.broadcast("pos_payment_success", {
+      invoiceId: result.invoice.id,
+      totalAmount: result.invoice.totalAmount,
+      paymentMethod
+    });
+
+    // Invalidate caches
+    await clearCache("/api/finance/dashboard").catch(() => {});
+    await clearCache("/api/finance/transactions").catch(() => {});
+    await clearCache("/api/admin/metrics").catch(() => {});
+    await clearCache("/api/reception/history").catch(() => {});
+
+    res.status(201).json({
+      success: true,
+      data: {
+        invoice: result.invoice,
+        tokens: result.tokens,
+        bookingReference: result.bookingRef,
+        patient: result.patient
+      }
+    });
+  } catch (error: any) {
+    console.error("Error in posDirectSale:", error);
+    res.status(500).json({ success: false, error: error.message || "Failed to process POS direct sale" });
   }
 };
 
@@ -1409,7 +2034,27 @@ export const getPOSHistory = async (req: Request, res: Response) => {
       take: 100,
       include: {
         User: { include: { room: true } },
+        room: true,
         Patient: true
+      }
+    });
+
+    const expenses = await prisma.expense.findMany({
+      where: search ? {
+        OR: [
+          { receiptNumber: { contains: search, mode: "insensitive" } },
+          { category: { contains: search, mode: "insensitive" } },
+          { description: { contains: search, mode: "insensitive" } },
+          { id: { contains: search, mode: "insensitive" } },
+          { user: { fullName: { contains: search, mode: "insensitive" } } },
+          ...(timeCondition ? [{ date: timeCondition.createdAt }] : [])
+        ]
+      } : undefined,
+      orderBy: { createdAt: "desc" },
+      take: 100,
+      include: {
+        user: { select: { id: true, fullName: true, email: true } },
+        shift: { select: { id: true, openedAt: true, status: true } }
       }
     });
 
@@ -1484,7 +2129,7 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           tokenNumber: matchedAppt.tokenNumber,
           department: matchedAppt.department,
           doctorName: matchedAppt.User?.fullName,
-          roomNumber: matchedAppt.User?.room?.roomNumber,
+          roomNumber: matchedAppt.room?.roomNumber || matchedAppt.User?.room?.roomNumber || null,
           bookingReference: matchedAppt.bookingReference,
           appointmentStatus: matchedAppt.status,
           appointmentId: matchedAppt.id,
@@ -1500,8 +2145,9 @@ export const getPOSHistory = async (req: Request, res: Response) => {
             department: matchedAppt.department,
             status: matchedAppt.status,
             doctorName: matchedAppt.User?.fullName,
-            roomNumber: matchedAppt.User?.room?.roomNumber,
+            roomNumber: matchedAppt.room?.roomNumber || matchedAppt.User?.room?.roomNumber || null,
             patientName: patient?.fullName || "Walk-in Patient",
+            patientAge: formatPatientAge(patient?.dateOfBirth, patient?.ageFallback),
             appointmentDate: matchedAppt.createdAt
           },
           invoice: {
@@ -1521,7 +2167,8 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           }
         });
       } else {
-        // Direct bill (e.g. Pharmacy OTC sale)
+        // Direct bill (e.g. Pharmacy OTC sale, Lab Test, Extra Service)
+        const primaryDept = inv.lineItems?.find((li: any) => li.department)?.department || "PHARMACY";
         unifiedItems.push({
           type: "INVOICE",
           id: inv.id,
@@ -1529,7 +2176,7 @@ export const getPOSHistory = async (req: Request, res: Response) => {
           patientId: inv.patientId,
           Patient: patient,
           tokenNumber: null,
-          department: "PHARMACY",
+          department: primaryDept,
           doctorName: null,
           roomNumber: null,
           bookingReference: null,
@@ -1596,6 +2243,45 @@ export const getPOSHistory = async (req: Request, res: Response) => {
       }
     });
 
+    // Add cashouts and drawer expenses
+    expenses.forEach(exp => {
+      unifiedItems.push({
+        type: "CASHOUT",
+        id: exp.id,
+        createdAt: exp.date || exp.createdAt,
+        patientId: null,
+        Patient: null,
+        tokenNumber: null,
+        department: "CASHOUT",
+        doctorName: null,
+        category: exp.category,
+        description: exp.description,
+        roomNumber: null,
+        bookingReference: null,
+        appointmentStatus: null,
+        appointmentId: null,
+        invoiceId: exp.receiptNumber || exp.id,
+        receiptNumber: exp.receiptNumber || exp.id,
+        totalAmount: exp.amount,
+        invoiceStatus: exp.status || "COMPLETED",
+        paymentMethod: exp.paymentMethod || "CASH (Drawer)",
+        cashierName: exp.user?.fullName || "Cashier",
+        lineItems: [],
+        token: null,
+        invoice: null,
+        expense: {
+          receiptNumber: exp.receiptNumber || exp.id,
+          category: exp.category,
+          amount: exp.amount,
+          description: exp.description,
+          paymentMethod: exp.paymentMethod || "CASH (Drawer)",
+          cashierName: exp.user?.fullName || "Cashier",
+          shiftRef: exp.shiftId || undefined,
+          timestamp: (exp.date || exp.createdAt).toISOString()
+        }
+      });
+    });
+
     unifiedItems.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     res.json({ success: true, data: unifiedItems.slice(0, 100) });
@@ -1607,6 +2293,18 @@ export const getPOSHistory = async (req: Request, res: Response) => {
 export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
   try {
     const { declaredCash } = req.body;
+    if (
+      declaredCash === undefined ||
+      declaredCash === null ||
+      String(declaredCash).trim() === "" ||
+      isNaN(Number(declaredCash)) ||
+      Number(declaredCash) < 0
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: "Please enter a valid non-negative numeric declared cash amount."
+      });
+    }
     const user = (req as any).user;
     if (!user) return res.status(401).json({ error: "Unauthorized" });
     
@@ -1626,7 +2324,7 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
 
     if (!shift) return res.status(400).json({ error: "No open shift found." });
     
-    const [payments, refunds, doctorDisbursements, todayAgg] = await Promise.all([
+    const [payments, refunds, doctorDisbursements, shiftExpenses, todayAgg] = await Promise.all([
       prisma.payment.findMany({
         where: { shiftId: shift.id, status: "COMPLETED" },
         include: {
@@ -1659,13 +2357,25 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
         where: {
           disbursedById: user.id,
           updatedAt: { gte: shift.openedAt },
-          cashDisbursed: { gt: 0 }
+          OR: [
+            { cashDisbursed: { gt: 0 } },
+            { bankDisbursed: { gt: 0 } }
+          ]
         },
         include: {
           doctor: {
             select: { id: true, fullName: true, specialty: true }
           }
         }
+      }),
+      prisma.expense.findMany({
+        where: { shiftId: shift.id, status: "COMPLETED" },
+        include: {
+          user: {
+            select: { id: true, fullName: true }
+          }
+        },
+        orderBy: { date: "asc" }
       }),
       (() => {
         const { startOfDay, endOfDay } = getTimezoneBoundaries();
@@ -1684,23 +2394,63 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       .map(p => p.invoice?.visitId)
       .filter((id): id is string => Boolean(id));
 
-    const visitAppointments = visitIds.length > 0
-      ? await prisma.appointment.findMany({
-          where: { id: { in: visitIds } },
-          include: {
-            User: {
-              select: {
-                id: true,
-                fullName: true,
-                specialty: true,
-                consultationFee: true,
-                commissionRate: true,
-                commissionType: true
+    // Collect all LAB line items and reference IDs
+    const labLineItems: Array<{ li: any; invoice: any; payment: any }> = [];
+    payments.forEach(p => {
+      (p.invoice?.lineItems || []).forEach(li => {
+        if ((li.department || "").toUpperCase() === "LAB") {
+          labLineItems.push({ li, invoice: p.invoice, payment: p });
+        }
+      });
+    });
+
+    const labRefIds = labLineItems
+      .map(item => item.li.referenceId)
+      .filter((id): id is string => Boolean(id));
+
+    const [visitAppointments, outsideLabTests, relatedLabRequests] = await Promise.all([
+      visitIds.length > 0
+        ? prisma.appointment.findMany({
+            where: { id: { in: visitIds } },
+            include: {
+              User: {
+                select: {
+                  id: true,
+                  fullName: true,
+                  specialty: true,
+                  consultationFee: true,
+                  commissionRate: true,
+                  commissionType: true
+                }
               }
             }
-          }
-        })
-      : [];
+          })
+        : [],
+      prisma.labTest.findMany({
+        where: { isOutsideTest: true }
+      }),
+      (labRefIds.length > 0 || visitIds.length > 0)
+        ? prisma.labRequest.findMany({
+            where: {
+              OR: [
+                ...(labRefIds.length > 0 ? [{ id: { in: labRefIds } }] : []),
+                ...(visitIds.length > 0 ? [{ visitId: { in: visitIds } }] : [])
+              ]
+            },
+            include: {
+              items: {
+                include: { LabTest: true }
+              },
+              Patient: {
+                select: { fullName: true, phone: true }
+              },
+              Visit: {
+                select: { tokenNumber: true, bookingReference: true }
+              }
+            }
+          })
+        : []
+    ]);
 
     const visitMap = new Map<string, any>();
     visitAppointments.forEach(va => visitMap.set(va.id, va));
@@ -1733,11 +2483,13 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
     let labSales = 0;
     let extraServiceSales = 0;
     let otherSales = 0;
+    let totalDiscounts = 0;
 
     const countedInvoices = new Set<string>();
     payments.forEach(p => {
       if (p.invoice && !countedInvoices.has(p.invoice.id)) {
         countedInvoices.add(p.invoice.id);
+        totalDiscounts += (p.invoice.discountAmount || 0);
         (p.invoice.lineItems || []).forEach(li => {
           const tot = li.total || 0;
           const dept = (li.department || "").toUpperCase();
@@ -1851,26 +2603,231 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       netDoctorPayment: doctorPayments.reduce((sum, d) => sum + d.netDoctorPayment, 0)
     };
 
-    // 5. Doctor Cash Disbursements
+    // 5. Doctor Cash & Bank Disbursements
     const totalDoctorCashDisbursed = doctorDisbursements.reduce((sum, d) => sum + (d.cashDisbursed || 0), 0);
+    const totalDoctorBankDisbursed = doctorDisbursements.reduce((sum, d) => sum + (d.bankDisbursed || 0), 0);
     const doctorDisbursementsList = doctorDisbursements.map(d => ({
       id: d.id,
       doctorName: d.doctor?.fullName || "Doctor",
       specialty: d.doctor?.specialty || "",
-      cashDisbursed: d.cashDisbursed,
+      cashDisbursed: d.cashDisbursed || 0,
+      bankDisbursed: d.bankDisbursed || 0,
       disbursedAt: d.updatedAt
     }));
 
-    // 6. Cash Balance & Drawer Reconciliation
+    // 6. Expenses & Cashouts during Shift
+    const totalCashExpenses = shiftExpenses
+      .filter(e => !e.paymentMethod || e.paymentMethod === "CASH")
+      .reduce((sum, e) => sum + (e.amount || 0), 0);
+    const outsourceLabCashDisbursed = shiftExpenses
+      .filter(e => (!e.paymentMethod || e.paymentMethod === "CASH") && e.category === "OUTSOURCE_LAB")
+      .reduce((sum, e) => sum + (e.amount || 0), 0);
+    const generalCashExpenses = Math.max(0, totalCashExpenses - outsourceLabCashDisbursed);
+    const totalExpenses = shiftExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
+
+    // 6.5. Outsource Lab Tests & Profit (Hospital Commission) Breakdown
+    const outsideTestByName = new Map<string, any>();
+    const outsideTestById = new Map<string, any>();
+    outsideLabTests.forEach(t => {
+      outsideTestByName.set(t.name.trim().toLowerCase(), t);
+      if (t.code) outsideTestByName.set(t.code.trim().toLowerCase(), t);
+      outsideTestById.set(t.id, t);
+    });
+
+    const labRequestById = new Map<string, any>();
+    const labRequestsByVisitId = new Map<string, any[]>();
+    relatedLabRequests.forEach(lr => {
+      labRequestById.set(lr.id, lr);
+      if (lr.visitId) {
+        const arr = labRequestsByVisitId.get(lr.visitId) || [];
+        arr.push(lr);
+        labRequestsByVisitId.set(lr.visitId, arr);
+      }
+    });
+
+    let outsourceLabGrossSales = 0;
+    let outsourceLabPartnerCost = 0;
+    let outsourceLabCommission = 0;
+
+    const centerAggMap = new Map<string, {
+      centerName: string;
+      testCount: number;
+      grossCollected: number;
+      partnerCost: number;
+      hospitalCommission: number;
+      cashDisbursed: number;
+    }>();
+
+    const outsourceTestItems: Array<{
+      testName: string;
+      centerName: string;
+      tokenNumber?: string;
+      patientName?: string;
+      grossPrice: number;
+      partnerCost: number;
+      commission: number;
+    }> = [];
+
+    const processedLabLineIds = new Set<string>();
+
+    labLineItems.forEach(({ li, invoice, payment }) => {
+      if (processedLabLineIds.has(li.id)) return;
+      processedLabLineIds.add(li.id);
+
+      const qty = li.quantity || 1;
+      const totalAmount = li.total || (li.unitPrice * qty);
+      const descLower = (li.description || "").toLowerCase();
+
+      let matchedTest: any = null;
+      let matchedReq: any = null;
+
+      // 1. By referenceId matching LabTest
+      if (li.referenceId && outsideTestById.has(li.referenceId)) {
+        matchedTest = outsideTestById.get(li.referenceId);
+      }
+
+      // 2. By referenceId matching LabRequest
+      if (!matchedTest && li.referenceId && labRequestById.has(li.referenceId)) {
+        matchedReq = labRequestById.get(li.referenceId);
+        const outsideItem = matchedReq.items?.find((it: any) => it.LabTest?.isOutsideTest);
+        if (outsideItem?.LabTest) {
+          matchedTest = outsideItem.LabTest;
+        }
+      }
+
+      // 3. By visitId matching LabRequest
+      if (!matchedTest && invoice?.visitId && labRequestsByVisitId.has(invoice.visitId)) {
+        const reqs = labRequestsByVisitId.get(invoice.visitId)!;
+        for (const req of reqs) {
+          const outsideItem = req.items?.find((it: any) => {
+            if (!it.LabTest?.isOutsideTest) return false;
+            const tName = (it.LabTest.name || "").toLowerCase();
+            return descLower.includes(tName);
+          }) || req.items?.find((it: any) => it.LabTest?.isOutsideTest);
+          if (outsideItem?.LabTest) {
+            matchedTest = outsideItem.LabTest;
+            matchedReq = req;
+            break;
+          }
+        }
+      }
+
+      // 4. By test name in description
+      if (!matchedTest) {
+        for (const [nameKey, t] of outsideTestByName.entries()) {
+          if (descLower.includes(nameKey)) {
+            matchedTest = t;
+            break;
+          }
+        }
+      }
+
+      const isOutsourcedText = descLower.includes("outsourced") || descLower.includes("outside");
+
+      if (matchedTest || isOutsourcedText) {
+        const cleanName = matchedTest?.name || li.description.replace(/^Lab Test\s*(\(Outsourced[^)]*\))?:\s*/i, "").trim();
+        const centerName = matchedTest?.outsourcedCenter || (
+          descLower.includes("asiri") ? "Asiri Laboratories" :
+          descLower.includes("ruhunu") ? "Ruhunu Hospital" :
+          "Asiri Laboratories"
+        );
+
+        let unitCost = matchedTest?.outsourceCost;
+        if (unitCost === null || unitCost === undefined || unitCost <= 0) {
+          unitCost = Math.round(li.unitPrice * 0.75 * 100) / 100;
+        }
+
+        const totalCost = Math.round(unitCost * qty * 100) / 100;
+        const totalCommission = Math.max(0, Math.round((totalAmount - totalCost) * 100) / 100);
+
+        outsourceLabGrossSales += totalAmount;
+        outsourceLabPartnerCost += totalCost;
+        outsourceLabCommission += totalCommission;
+
+        const currentCenter = centerAggMap.get(centerName) || {
+          centerName,
+          testCount: 0,
+          grossCollected: 0,
+          partnerCost: 0,
+          hospitalCommission: 0,
+          cashDisbursed: 0
+        };
+        currentCenter.testCount += qty;
+        currentCenter.grossCollected += totalAmount;
+        currentCenter.partnerCost += totalCost;
+        currentCenter.hospitalCommission += totalCommission;
+        centerAggMap.set(centerName, currentCenter);
+
+        const patientName = matchedReq?.Patient?.fullName || payment?.Appointment?.Patient?.fullName || invoice?.patient?.fullName || "Patient";
+        const tokenNumber = matchedReq?.Visit?.tokenNumber || payment?.Appointment?.tokenNumber;
+
+        outsourceTestItems.push({
+          testName: cleanName,
+          centerName,
+          tokenNumber,
+          patientName,
+          grossPrice: totalAmount,
+          partnerCost: totalCost,
+          commission: totalCommission
+        });
+      }
+    });
+
+    // Attribute recorded outsource lab expenses to respective partner centers
+    shiftExpenses.forEach(e => {
+      if ((!e.paymentMethod || e.paymentMethod === "CASH") && e.category === "OUTSOURCE_LAB") {
+        const dLower = (e.description || "").toLowerCase();
+        let matchedCenterName: string | null = null;
+        for (const centerName of centerAggMap.keys()) {
+          if (dLower.includes(centerName.toLowerCase())) {
+            matchedCenterName = centerName;
+            break;
+          }
+        }
+        if (!matchedCenterName && centerAggMap.size > 0) {
+          matchedCenterName = Array.from(centerAggMap.keys())[0] || null;
+        }
+        if (matchedCenterName) {
+          const c = centerAggMap.get(matchedCenterName);
+          if (c) c.cashDisbursed += (e.amount || 0);
+        }
+      }
+    });
+
+    const inHouseLabSales = Math.max(0, Math.round((labSales - outsourceLabGrossSales) * 100) / 100);
+
+    const outsourceLabSummary = {
+      totalTests: outsourceTestItems.length,
+      grossCollected: outsourceLabGrossSales,
+      partnerCost: outsourceLabPartnerCost,
+      hospitalCommission: outsourceLabCommission,
+      cashDisbursed: outsourceLabCashDisbursed,
+      pendingDisbursement: Math.max(0, Math.round((outsourceLabPartnerCost - outsourceLabCashDisbursed) * 100) / 100),
+      inHouseLabSales,
+      centers: Array.from(centerAggMap.values()),
+      testItems: outsourceTestItems
+    };
+
+    const hospitalNetEarnings = {
+      doctorCommissions: totalDoctorPayments.hospitalCommission,
+      outsourceLabCommissions: outsourceLabCommission,
+      totalHospitalCommission: totalDoctorPayments.hospitalCommission + outsourceLabCommission,
+      inHouseLabRevenue: inHouseLabSales,
+      pharmacyGrossRevenue: pharmacySales,
+      extraServicesRevenue: extraServiceSales,
+      totalHospitalGrossEarnings: totalDoctorPayments.hospitalCommission + outsourceLabCommission + inHouseLabSales + pharmacySales + extraServiceSales
+    };
+
+    // 7. Cash Balance & Drawer Reconciliation
     const startingFloat = shift.openingFloat || 0;
     const totalSales = systemCashTotal + systemCardTotal + systemBankTotal + systemQrTotal;
     const netSales = totalSales - (cashRefundsTotal + nonCashRefundsTotal);
-    const expectedCash = startingFloat + systemCashTotal - cashRefundsTotal - totalDoctorCashDisbursed;
-    const actualCash = Number(declaredCash);
+    const expectedCash = startingFloat + systemCashTotal - cashRefundsTotal - totalDoctorCashDisbursed - totalCashExpenses;
+    const actualCash = Math.round(Number(declaredCash) * 100) / 100;
     const variance = actualCash - expectedCash;
     const varianceStatus = Math.abs(variance) < 0.01 ? "BALANCED" : variance > 0 ? "SURPLUS" : "SHORTAGE";
 
-    // 7. Update Shift in Database
+    // 8. Update Shift in Database
     const closedAt = new Date();
     await prisma.cashRegisterShift.update({
       where: { id: shift.id },
@@ -1912,7 +2869,9 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       nonCashTotal: systemCardTotal + systemBankTotal + systemQrTotal,
       grossSales: totalSales,
       totalSales,
+      totalDiscounts,
       cashRefundsTotal,
+      nonCashRefundsTotal,
       totalRefunds: cashRefundsTotal + nonCashRefundsTotal,
       netSales,
       todayHospitalTotalSales: todayAgg._sum.amount || 0,
@@ -1920,6 +2879,8 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
         consultations: consultationSales,
         pharmacy: pharmacySales,
         lab: labSales,
+        inHouseLab: inHouseLabSales,
+        outsourceLab: outsourceLabGrossSales,
         extraServices: extraServiceSales,
         other: otherSales
       },
@@ -1929,21 +2890,160 @@ export const closeShiftAndGetSummary = async (req: Request, res: Response) => {
       cashCollected: systemCashTotal,
       cashRefunds: cashRefundsTotal,
       doctorCashDisbursed: totalDoctorCashDisbursed,
+      outsourceLabCashDisbursed,
+      generalCashExpenses,
+      cashExpenses: totalCashExpenses,
+      totalExpenses,
       expectedCash,
       actualCash,
       declaredCash: actualCash,
       variance,
       varianceStatus,
+      shiftExpensesList: shiftExpenses.map(e => ({
+        id: e.id,
+        receiptNumber: e.receiptNumber,
+        category: e.category,
+        amount: e.amount,
+        description: e.description,
+        paymentMethod: e.paymentMethod,
+        date: e.date,
+        recordedBy: e.user?.fullName || "Cashier"
+      })),
 
       // 4. Doctor Payments
       doctorPayments,
-      totalDoctorPayments,
-      doctorDisbursementsList
+      totalDoctorPayments: {
+        ...totalDoctorPayments,
+        totalDoctorCashDisbursed,
+        totalDoctorBankDisbursed
+      },
+      doctorBankDisbursed: totalDoctorBankDisbursed,
+      doctorDisbursementsList,
+
+      // 5. Outsource Lab Summary & Profit (Hospital Commission)
+      outsourceLabSummary,
+
+      // 6. Hospital Net Commissions / Retained Earnings
+      hospitalNetEarnings
     };
 
     res.json({ success: true, data: summary });
   } catch (error: any) {
     console.error("closeShiftAndGetSummary error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * Record a Frontdesk Cashout or Cash Drawer Expense
+ * POST /api/reception/cashout
+ */
+export const recordCashout = async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    if (!user) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const { category, amount, description, paymentMethod } = req.body;
+
+    const numAmount = Number(amount);
+    if (!numAmount || isNaN(numAmount) || numAmount <= 0) {
+      return res.status(400).json({ success: false, error: "A valid positive amount is required." });
+    }
+
+    if (!description || typeof description !== "string" || !description.trim()) {
+      return res.status(400).json({ success: false, error: "A description or reason is required." });
+    }
+
+    // Require an active open shift for cashout / drawer expense
+    const shift = await prisma.cashRegisterShift.findFirst({
+      where: { openedBy: user.id, status: "OPEN" },
+      orderBy: { openedAt: "desc" }
+    });
+
+    if (!shift) {
+      return res.status(400).json({
+        success: false,
+        error: "You must have an OPEN cashier shift to record a cashout or expense."
+      });
+    }
+
+    // Generate unique receipt number e.g. EXP-20261113-ABCD
+    const now = new Date();
+    const datePrefix = now.toISOString().slice(0, 10).replace(/-/g, "");
+    const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const receiptNumber = `EXP-${datePrefix}-${randomSuffix}`;
+
+    const expense = await prisma.expense.create({
+      data: {
+        category: category || "Cashout / Drawer Drop",
+        amount: numAmount,
+        description: description.trim(),
+        paymentMethod: paymentMethod || "CASH",
+        receiptNumber,
+        status: "COMPLETED",
+        shiftId: shift.id,
+        userId: user.id,
+        date: now
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            fullName: true,
+            email: true,
+            Role: { select: { name: true } }
+          }
+        },
+        shift: {
+          select: {
+            id: true,
+            openedAt: true,
+            status: true
+          }
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: "Cashout recorded successfully.",
+      data: expense
+    });
+  } catch (error: any) {
+    console.error("recordCashout error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * Get Expenses / Cashouts for the current active shift
+ * GET /api/reception/shift-expenses
+ */
+export const getShiftExpenses = async (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    if (!user) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+    const shift = await prisma.cashRegisterShift.findFirst({
+      where: { openedBy: user.id, status: "OPEN" },
+      orderBy: { openedAt: "desc" }
+    });
+
+    if (!shift) {
+      return res.json({ success: true, data: [] });
+    }
+
+    const expenses = await prisma.expense.findMany({
+      where: { shiftId: shift.id },
+      orderBy: { createdAt: "desc" },
+      include: {
+        user: { select: { fullName: true } }
+      }
+    });
+
+    res.json({ success: true, data: expenses });
+  } catch (error: any) {
+    console.error("getShiftExpenses error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 };

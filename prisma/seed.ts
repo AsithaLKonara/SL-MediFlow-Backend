@@ -69,10 +69,13 @@ async function main() {
   const password = await bcrypt.hash('password123', salt);
 
   const staffUsersData = [
+  const staffUsersData = [
     { email: 'admin@slmediflow.com', fullName: 'System Admin', role: 'Superadmin' },
     { email: 'reception@slmediflow.com', fullName: 'Alice Reception', role: 'Receptionist' },
     { email: 'labtech@slmediflow.com', fullName: 'Charlie Lab', role: 'LabTech' },
     { email: 'nurse@slmediflow.com', fullName: 'Nancy Nurse', role: 'Nurse' },
+    { email: 'pharmacist@slmediflow.com', fullName: 'Peter Pharmacist', role: 'Pharmacist' },
+  ];
   ];
 
   await Promise.all(staffUsersData.map(u => {

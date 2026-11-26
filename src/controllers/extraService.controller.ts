@@ -20,6 +20,13 @@ export const extraServiceController = {
               roomNumber: true,
               department: true
             }
+          },
+          doctor: {
+            select: {
+              id: true,
+              fullName: true,
+              specialty: true
+            }
           }
         },
         orderBy: { createdAt: 'desc' }
@@ -32,7 +39,19 @@ export const extraServiceController = {
 
   createService: async (req: Request, res: Response) => {
     try {
-      const { title, description, price, barcode, roomId, roomNumber } = req.body;
+      const {
+        title,
+        description,
+        price,
+        barcode,
+        roomId,
+        roomNumber,
+        doctorId,
+        doctorCommissionType,
+        doctorCommissionRate,
+        hospitalCommissionType,
+        hospitalCommissionRate
+      } = req.body;
       
       if (!/^\d{10}$/.test(barcode)) {
         return res.status(400).json({ error: "Barcode must be exactly 10 digits." });
@@ -50,7 +69,12 @@ export const extraServiceController = {
           description,
           price: parseFloat(price),
           barcode,
-          roomId: targetRoomId
+          roomId: targetRoomId,
+          doctorId: doctorId || null,
+          doctorCommissionType: doctorCommissionType || "PERCENTAGE",
+          doctorCommissionRate: doctorCommissionRate !== undefined ? parseFloat(doctorCommissionRate) : 0,
+          hospitalCommissionType: hospitalCommissionType || "PERCENTAGE",
+          hospitalCommissionRate: hospitalCommissionRate !== undefined ? parseFloat(hospitalCommissionRate) : 0
         },
         include: {
           room: {
@@ -59,9 +83,31 @@ export const extraServiceController = {
               roomNumber: true,
               department: true
             }
+          },
+          doctor: {
+            select: {
+              id: true,
+              fullName: true,
+              specialty: true
+            }
           }
         }
       });
+
+      // Seed initial forward-only price version
+      await (prisma as any).extraServicePriceVersion.create({
+        data: {
+          serviceId: service.id,
+          price: service.price,
+          doctorCommissionRate: service.doctorCommissionRate || 0,
+          doctorCommissionType: service.doctorCommissionType || "PERCENTAGE",
+          hospitalCommissionRate: service.hospitalCommissionRate || 0,
+          hospitalCommissionType: service.hospitalCommissionType || "PERCENTAGE",
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+
       await clearCache('*extra-services*');
       res.status(201).json(service);
     } catch (e: any) {
@@ -76,7 +122,20 @@ export const extraServiceController = {
   updateService: async (req: Request, res: Response) => {
     try {
       const id = req.params.id as string;
-      const { title, description, price, barcode, roomId, roomNumber, isActive } = req.body;
+      const {
+        title,
+        description,
+        price,
+        barcode,
+        roomId,
+        roomNumber,
+        isActive,
+        doctorId,
+        doctorCommissionType,
+        doctorCommissionRate,
+        hospitalCommissionType,
+        hospitalCommissionRate
+      } = req.body;
       
       if (barcode && !/^\d{10}$/.test(barcode)) {
         return res.status(400).json({ error: "Barcode must be exactly 10 digits." });
@@ -92,6 +151,40 @@ export const extraServiceController = {
         }
       }
 
+      // Audit & version forward-only if financial parameters changed
+      const currentSvc = await prisma.extraService.findUnique({ where: { id } });
+      const isPriceChanged = price !== undefined && currentSvc && parseFloat(price) !== currentSvc.price;
+      const isDocCommChanged = (doctorCommissionRate !== undefined && currentSvc && parseFloat(doctorCommissionRate) !== currentSvc.doctorCommissionRate) ||
+        (doctorCommissionType !== undefined && currentSvc && doctorCommissionType !== currentSvc.doctorCommissionType);
+      const isHospCommChanged = (hospitalCommissionRate !== undefined && currentSvc && parseFloat(hospitalCommissionRate) !== currentSvc.hospitalCommissionRate) ||
+        (hospitalCommissionType !== undefined && currentSvc && hospitalCommissionType !== currentSvc.hospitalCommissionType);
+
+      if (currentSvc && (isPriceChanged || isDocCommChanged || isHospCommChanged)) {
+        await (prisma as any).extraServicePriceVersion.updateMany({
+          where: { serviceId: id, isActive: true },
+          data: { isActive: false, effectiveTo: new Date() }
+        }).catch(console.error);
+
+        const newPrice = price !== undefined ? parseFloat(price) : currentSvc.price;
+        const newDocCommRate = doctorCommissionRate !== undefined ? (parseFloat(doctorCommissionRate) || 0) : (currentSvc.doctorCommissionRate || 0);
+        const newDocCommType = doctorCommissionType !== undefined ? doctorCommissionType : (currentSvc.doctorCommissionType || "PERCENTAGE");
+        const newHospCommRate = hospitalCommissionRate !== undefined ? (parseFloat(hospitalCommissionRate) || 0) : (currentSvc.hospitalCommissionRate || 0);
+        const newHospCommType = hospitalCommissionType !== undefined ? hospitalCommissionType : (currentSvc.hospitalCommissionType || "PERCENTAGE");
+
+        await (prisma as any).extraServicePriceVersion.create({
+          data: {
+            serviceId: id,
+            price: newPrice,
+            doctorCommissionRate: newDocCommRate,
+            doctorCommissionType: newDocCommType,
+            hospitalCommissionRate: newHospCommRate,
+            hospitalCommissionType: newHospCommType,
+            effectiveFrom: new Date(),
+            isActive: true
+          }
+        }).catch(console.error);
+      }
+
       const service = await prisma.extraService.update({
         where: { id },
         data: {
@@ -100,7 +193,12 @@ export const extraServiceController = {
           ...(price !== undefined ? { price: parseFloat(price) } : {}),
           ...(barcode !== undefined ? { barcode } : {}),
           ...(targetRoomId !== undefined ? { roomId: targetRoomId } : {}),
-          ...(isActive !== undefined ? { isActive: Boolean(isActive) } : {})
+          ...(isActive !== undefined ? { isActive: Boolean(isActive) } : {}),
+          ...(doctorId !== undefined ? { doctorId: doctorId || null } : {}),
+          ...(doctorCommissionType !== undefined ? { doctorCommissionType } : {}),
+          ...(doctorCommissionRate !== undefined ? { doctorCommissionRate: parseFloat(doctorCommissionRate) || 0 } : {}),
+          ...(hospitalCommissionType !== undefined ? { hospitalCommissionType } : {}),
+          ...(hospitalCommissionRate !== undefined ? { hospitalCommissionRate: parseFloat(hospitalCommissionRate) || 0 } : {})
         },
         include: {
           room: {
@@ -108,6 +206,13 @@ export const extraServiceController = {
               id: true,
               roomNumber: true,
               department: true
+            }
+          },
+          doctor: {
+            select: {
+              id: true,
+              fullName: true,
+              specialty: true
             }
           }
         }
@@ -145,7 +250,8 @@ export const extraServiceController = {
         prisma.appointment.findMany({
           where: {
             department: "EXTRA_SERVICE",
-            appointmentDate: { gte: startOfDay, lte: endOfDay }
+            appointmentDate: { gte: startOfDay, lte: endOfDay },
+            status: { not: "CANCELLED" }
           },
           include: {
             Patient: true,
@@ -155,7 +261,8 @@ export const extraServiceController = {
         }),
         prisma.extraServiceOrder.findMany({
           where: {
-            createdAt: { gte: startOfDay, lte: endOfDay }
+            createdAt: { gte: startOfDay, lte: endOfDay },
+            status: { not: "CANCELLED" }
           },
           include: {
             service: {

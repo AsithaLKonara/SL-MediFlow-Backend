@@ -1,5 +1,7 @@
 import { prisma, withRetry } from "../lib/prisma.js";
 import { SMSService } from "./sms.service.js";
+import { isOpdDoctor } from "../utils/doctor-utils.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export class NotificationService {
   static initSweeper() {
@@ -44,6 +46,9 @@ export class NotificationService {
     templateName: string,
     variables: Record<string, string>
   ) {
+    if (!phone || phone.startsWith('WALKIN') || phone.startsWith('NO-PHONE') || phone.startsWith('NO_PHONE')) {
+      return null;
+    }
     return withRetry(async () => {
       let template = await prisma.smsTemplate.findUnique({ where: { name: templateName } });
 
@@ -78,6 +83,11 @@ export class NotificationService {
           template = {
             id: 'temp', name: 'SESSION_CANCELLED', isActive: true, createdAt: new Date(), updatedAt: new Date(),
             content: 'SL Medi Flow: Appointment for {{patientName}} with Dr. {{doctorName}} on {{date}} is cancelled ({{reason}}). Inquiries: +94 11 234 5678'
+          };
+        } else if (templateName === 'OPD_BILL_RECEIPT' || templateName === 'BILL_RECEIPT') {
+          template = {
+            id: 'temp', name: templateName, isActive: true, createdAt: new Date(), updatedAt: new Date(),
+            content: 'SL Medi Flow Bill: Payment of LKR {{totalAmount}} received for {{patientName}}. Token #{{tokenNumber}} (Dr. {{doctorName}}). Ref: {{billRef}}. Thank you!'
           };
         } else {
           console.warn(`SMS Template ${templateName} not found in DB and no fallback available.`);
@@ -140,18 +150,51 @@ export class NotificationService {
     });
   }
 
+  /**
+   * Send OPD Bill Receipt SMS upon payment/checkout.
+   * Clinical Rule: OPD doctors send SMS bills ONLY (no booking confirmation, no arrival alerts).
+   */
+  static async sendOpdBillSMS(params: {
+    patientId: string;
+    phone: string;
+    patientName: string;
+    doctorName?: string;
+    tokenNumber?: string | number;
+    totalAmount: string | number;
+    billRef: string;
+  }) {
+    if (!params.phone || params.phone.startsWith('WALKIN') || params.phone.startsWith('NO-PHONE') || params.phone.startsWith('NO_PHONE')) return null;
+    return this.sendTemplatedSMS(
+      params.patientId,
+      params.phone,
+      'OPD_BILL_RECEIPT',
+      {
+        patientName: params.patientName || 'Patient',
+        doctorName: (params.doctorName || 'OPD Doctor').replace(/^Dr\.?\s*/i, ''),
+        tokenNumber: String(params.tokenNumber || '-'),
+        totalAmount: Number(params.totalAmount || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }),
+        billRef: params.billRef || '-'
+      }
+    );
+  }
+
   static async triggerDoctorArrived(doctorId: string, sessionDate: Date, roomNumberParam?: string) {
     return withRetry(async () => {
-      const startOfDay = new Date(sessionDate);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(sessionDate);
-      endOfDay.setHours(23, 59, 59, 999);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries(sessionDate);
 
       // Fetch doctor details and room
       const doctor = await prisma.user.findUnique({
         where: { id: doctorId },
-        select: { fullName: true }
+        select: { fullName: true, specialty: true, Department: { select: { name: true } } }
       });
+
+      // Clinical Rule: OPD doctors are continuously on-duty; suppress arrival SMS alerts for OPD.
+      // Other doctors (specialists/consultants) MUST send arrival alerts to waiting patients.
+      if (doctor && isOpdDoctor(doctor)) {
+        console.info(`[NotificationService] Doctor ${doctor.fullName} is an OPD doctor. Suppressing arrival SMS.`);
+        return 0;
+      }
+
       const doctorName = (doctor?.fullName || "Consultant").replace(/^Dr\.?\s*/i, "");
 
       let roomNumber = roomNumberParam || "";

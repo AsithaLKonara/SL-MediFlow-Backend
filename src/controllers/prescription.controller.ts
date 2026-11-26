@@ -3,7 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { websocketService } from "../services/websocket.service.js";
 import { billingService } from "../services/billing.service.js";
 import { pharmacyService } from "../services/pharmacy.service.js";
-import { getTimezoneBoundaries } from "../lib/dateUtils.js";
+import { getTimezoneBoundaries, formatPatientAge } from "../lib/dateUtils.js";
 
 // In case of transient NeonDB errors, wrapped execution:
 const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delay = 1000): Promise<T> => {
@@ -19,7 +19,7 @@ const withRetry = async <T>(operation: () => Promise<T>, retries = 3, delay = 10
   }
 };
 
-export const VALID_FREQUENCIES = ["OD", "BD", "TDS", "QDS", "QID", "EOD", "STAT", "CUSTOM"] as const;
+export const VALID_FREQUENCIES = ["OD", "BD", "TDS", "QDS", "QID", "MANE", "NOCTE", "EOD", "STAT", "CUSTOM"] as const;
 export const VALID_ROUTES = ["ORAL", "SUPPOSITORY", "IM", "IV", "SC", "OTHER"] as const;
 
 export const calcDispenseQty = (item: any): number => {
@@ -68,7 +68,14 @@ export const calcDispenseQty = (item: any): number => {
     if (!isNaN(parsed) && parsed > 0) timesPerDay = parsed;
   }
 
-  if (freq === "OD" || freq === "ONCE DAILY") {
+  if (
+    freq === "OD" ||
+    freq === "ONCE DAILY" ||
+    freq === "MANE" ||
+    freq === "MORNING" ||
+    freq === "NOCTE" ||
+    freq === "NIGHT"
+  ) {
     timesPerDay = 1;
   } else if (freq === "BD" || freq === "BID" || freq === "TWICE DAILY") {
     timesPerDay = 2;
@@ -104,7 +111,13 @@ export const getPrescriptionById = async (req: Request, res: Response) => {
         items: {
           include: {
             medicine: {
-              include: { stockBatches: { orderBy: { expiryDate: 'asc' }, take: 1 } }
+              include: {
+                stockBatches: {
+                  where: { currentQuantity: { gt: 0 } },
+                  orderBy: { expiryDate: 'asc' },
+                  take: 1
+                }
+              }
             }
           }
         }
@@ -160,8 +173,11 @@ export const getPrescriptionById = async (req: Request, res: Response) => {
         medicine: i.medicine ? {
           id: i.medicine.id,
           name: i.medicine.name,
+          form: i.medicine.form || null,
+          strength: i.medicine.strength || null,
           unit: i.medicine.unit,
           packSize: i.medicine.packSize ?? 1,
+          retailPrice: i.medicine.retailPrice ?? 0,
           stockBatches: i.medicine.stockBatches
         } : null
       })),
@@ -349,23 +365,19 @@ export const createPrescription = async (req: Request, res: Response): Promise<v
               });
             }
           }
-
-          if (req.body.extraServices && Array.isArray(req.body.extraServices)) {
-            for (const svc of req.body.extraServices) {
-              const targetPrice = Number(svc.customPrice !== undefined ? svc.customPrice : (svc.price ?? 0));
-              await billingService.addCharge({
-                visitId,
-                patientId,
-                department: "EXTRA_SERVICE",
-                referenceId: svc.id,
-                description: `Extra Service: ${svc.title}`,
-                quantity: 1,
-                unitPrice: targetPrice
-              }, tx);
-            }
+          // Automatically transition linked appointment to COMPLETED upon prescription submission
+          if (visitIds && visitIds.length > 0) {
+            await tx.appointment.updateMany({
+              where: {
+                id: { in: visitIds },
+                status: { in: ["BOOKED", "CHECKED_IN", "IN_PROGRESS"] }
+              },
+              data: {
+                status: "COMPLETED",
+                completedAt: new Date()
+              }
+            });
           }
-          // NOTE: Appointment status is NOT changed here. The doctor must explicitly
-          // click "Complete Consultation" to remove the patient from the queue.
         }
 
         return {
@@ -377,6 +389,10 @@ export const createPrescription = async (req: Request, res: Response): Promise<v
 
     // Broadcast via WebSockets
     websocketService.broadcast("prescription_created", newPrescription);
+    websocketService.broadcast("token_status_updated", {
+      patientId: newPrescription.patientId,
+      status: "COMPLETED"
+    });
 
     res.status(201).json(newPrescription);
   } catch (error) {
@@ -474,8 +490,14 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
           const paidInv = invList.find((inv: any) => inv.status === 'PAID');
           fullInvoiceStatus = draftInv ? 'DRAFT' : (paidInv ? 'PAID' : invList[0].status);
 
-          consultationPaid = invList.some((inv: any) => 
-            inv.status === 'PAID' && inv.lineItems?.some((li: any) => li.department === 'CONSULTATION')
+          const hasDraftConsult = invList.some((inv: any) =>
+            inv.status === 'DRAFT' && inv.lineItems?.some((li: any) => li.department === 'CONSULTATION')
+          );
+
+          consultationPaid = !hasDraftConsult && invList.some((inv: any) => 
+            inv.status === 'PAID' && 
+            (inv.totalAmount || 0) > 0 &&
+            inv.lineItems?.some((li: any) => li.department === 'CONSULTATION' && (li.total || 0) > 0)
           );
         }
 
@@ -490,14 +512,8 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
 
       const doctor = rx.doctorId ? doctorMap.get(rx.doctorId) || null : null;
 
-      let patientAge = "N/A";
-      if (rx.Patient?.dateOfBirth) {
-        const diff = Date.now() - new Date(rx.Patient.dateOfBirth).getTime();
-        const ageDate = new Date(diff);
-        patientAge = Math.abs(ageDate.getUTCFullYear() - 1970).toString();
-      } else if (rx.Patient?.ageFallback) {
-        patientAge = rx.Patient.ageFallback.toString();
-      }
+      const formattedAge = formatPatientAge(rx.Patient?.dateOfBirth, rx.Patient?.ageFallback);
+      let patientAge = formattedAge !== null && formattedAge !== undefined ? formattedAge.toString() : "N/A";
 
       return {
         ...rx,
@@ -508,7 +524,7 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
           const dispenseQty = calcDispenseQty(i);
           const batches = i.medicine?.stockBatches || [];
           const totalStock = batches.reduce((sum: number, b: any) => sum + (b.currentQuantity || 0), 0);
-          const unitPrice = batches[0]?.unitPrice ?? 0;
+          const unitPrice = batches[0]?.unitPrice ?? i.medicine?.retailPrice ?? 0;
           return {
             ...i,
             dispenseQty,
@@ -516,7 +532,8 @@ export const getPendingPrescriptions = async (req: Request, res: Response): Prom
             unitPrice,
             medicine: i.medicine ? {
               ...i.medicine,
-              packSize: i.medicine.packSize ?? 1
+              packSize: i.medicine.packSize ?? 1,
+              retailPrice: i.medicine.retailPrice ?? 0
             } : null
           };
         }),
@@ -574,20 +591,31 @@ export const markPrescriptionDispensed = async (req: Request, res: Response): Pr
             });
 
             if (rxItem?.medicineId && di.dispenseQty > 0) {
+              const med = rxItem.medicine;
+              const isSyrup = (rxItem.doseUnit?.trim().toLowerCase() === "ml") ||
+                ["syrup", "suspension", "liquid"].includes(med?.form?.trim().toLowerCase() || "") ||
+                (med?.unit?.trim().toLowerCase() === "bottle" && (med?.packSize || 1) > 1);
+
+              const dispensedMl = isSyrup ? di.dispenseQty : undefined;
+
               // Delegate to pharmacyService for secure, locked FIFO deduction
               const dispenseResult = await pharmacyService.dispenseMedicine(
                 rxItem.medicineId,
                 di.dispenseQty,
                 { skipBilling: true },
-                tx
+                tx,
+                dispensedMl
               );
 
               totalPharmacyCost += dispenseResult.totalCost;
-              const actualDispensed = dispenseResult.batchesUsed.reduce((sum: number, b: any) => sum + b.quantityDispensed, 0);
+              // For syrups, preserve prescribed ml in dispenseQty; for solids, record units dispensed
+              const recordedQty = isSyrup
+                ? di.dispenseQty
+                : dispenseResult.batchesUsed.reduce((sum: number, b: any) => sum + b.quantityDispensed, 0);
               
               await tx.prescriptionItem.update({
                 where: { id: di.itemId },
-                data: { dispenseQty: actualDispensed }
+                data: { dispenseQty: recordedQty }
               });
             } else if (rxItem) {
               await tx.prescriptionItem.update({
@@ -889,7 +917,7 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
                   include: {
                     stockBatches: {
                       where: { currentQuantity: { gt: 0 } },
-                      orderBy: { createdAt: 'asc' as const },
+                      orderBy: { expiryDate: 'asc' as const },
                       take: 1,
                     }
                   }
@@ -978,22 +1006,28 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
                 });
               }
             }
-
-            if (req.body.extraServices && Array.isArray(req.body.extraServices)) {
-              for (const svc of req.body.extraServices) {
-                const targetPrice = Number(svc.customPrice !== undefined ? svc.customPrice : (svc.price ?? 0));
-                await billingService.addCharge({
-                  visitId: rx.visitId,
-                  patientId: rx.patientId,
-                  department: "EXTRA_SERVICE",
-                  referenceId: svc.id,
-                  description: `Extra Service: ${svc.title}`,
-                  quantity: 1,
-                  unitPrice: targetPrice
-                }, tx);
-              }
-            }
           }
+        }
+
+        if (rx.visitId) {
+          const apptIdsToComplete = [rx.visitId];
+          if (bookingRef) {
+            const linked = await tx.appointment.findMany({
+              where: { bookingReference: bookingRef },
+              select: { id: true }
+            });
+            linked.forEach((l: any) => apptIdsToComplete.push(l.id));
+          }
+          await tx.appointment.updateMany({
+            where: {
+              id: { in: apptIdsToComplete },
+              status: { in: ["BOOKED", "CHECKED_IN", "IN_PROGRESS"] }
+            },
+            data: {
+              status: "COMPLETED",
+              completedAt: new Date()
+            }
+          });
         }
 
         const visitLrs = rx.visitId ? await tx.labRequest.findMany({
@@ -1007,13 +1041,27 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
           tests: lr.items.map((item: any) => item.LabTest?.name || "Unknown Test")
         }));
 
+        const visitExs = rx.visitId ? await tx.extraServiceOrder.findMany({
+          where: { visitId: rx.visitId, status: { not: "CANCELLED" } },
+          include: { service: true }
+        }) : [];
+        const extraServicesData = visitExs.map((ex: any) => ({
+          id: ex.serviceId,
+          orderId: ex.id,
+          orderNumber: ex.orderNumber,
+          title: ex.service?.title || "Extra Service",
+          price: ex.finalPrice ?? ex.service?.price ?? 0,
+          status: ex.status
+        }));
+
         return {
           ...updated,
           patientName: updated.patientName || updated.Patient?.fullName || "Walk-in",
           doctorName: updated.doctorName || doctor?.fullName || "Doctor",
           bookingReference: bookingRef,
           doctor,
-          labRequests: labRequestsData
+          labRequests: labRequestsData,
+          extraServices: extraServicesData
         };
       }, { maxWait: 20000, timeout: 20000 });
     });
@@ -1021,6 +1069,10 @@ export const updatePrescription = async (req: Request, res: Response): Promise<v
     // Broadcast via WebSockets to pharmacy and frontdesk
     websocketService.broadcast("prescription_created", updatedRx);
     websocketService.broadcast("prescription_updated", updatedRx);
+    websocketService.broadcast("token_status_updated", {
+      patientId: updatedRx.patientId,
+      status: "COMPLETED"
+    });
 
     res.json(updatedRx);
   } catch (error: any) {
@@ -1088,7 +1140,14 @@ export const addItemToPrescription = async (req: Request, res: Response): Promis
         status: item.status || "ACTIVE"
       },
       include: {
-        medicine: true
+        medicine: {
+          include: {
+            stockBatches: {
+              where: { currentQuantity: { gt: 0 } },
+              orderBy: { expiryDate: "asc" }
+            }
+          }
+        }
       }
     }));
 
@@ -1138,7 +1197,14 @@ export const updatePrescriptionItem = async (req: Request, res: Response): Promi
         status: item.status !== undefined ? item.status : undefined
       },
       include: {
-        medicine: true
+        medicine: {
+          include: {
+            stockBatches: {
+              where: { currentQuantity: { gt: 0 } },
+              orderBy: { expiryDate: "asc" }
+            }
+          }
+        }
       }
     }));
 

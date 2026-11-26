@@ -1,5 +1,6 @@
 import { prisma } from "../lib/prisma.js";
 import bcrypt from 'bcryptjs';
+import { validatePasswordStrength } from "../utils/password.util.js";
 
 export class UserService {
   /**
@@ -92,6 +93,11 @@ export class UserService {
    * Update password
    */
   async updatePassword(userId: string, currentPass: string, newPass: string) {
+    const validation = validatePasswordStrength(newPass);
+    if (!validation.isValid) {
+      throw new Error(validation.message || 'Password must be at least 8 characters long');
+    }
+
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) throw new Error('User not found');
 

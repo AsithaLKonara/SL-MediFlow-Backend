@@ -67,3 +67,101 @@ export function getTimezoneBoundaries(dateInput: Date | string = new Date(), tim
 export function getColomboDayOfWeek(date: Date | string = new Date()): number {
   return getTimezoneBoundaries(date, 'Asia/Colombo').dayOfWeek;
 }
+
+export interface ParsedAge {
+  valid: boolean;
+  value: number;
+  unit: 'M' | 'Y';
+  error?: string;
+}
+
+/**
+ * Validates and parses an age input string or number.
+ * Accepts formats:
+ * - "11M", "11m" -> 11 months (valid 1-240)
+ * - "25Y", "25y" -> 25 years (valid 1-130)
+ * - "25", 25 -> 25 years (valid 1-130, defaults to Y)
+ */
+export function parseAgeString(ageInput: string | number | null | undefined): ParsedAge {
+  if (ageInput === undefined || ageInput === null || String(ageInput).trim() === '') {
+    return { valid: false, value: 0, unit: 'Y', error: 'Valid Patient Age (1-130) is mandatory for token generation.' };
+  }
+  const match = String(ageInput).trim().match(/^(\d+)\s*([mMyY]?)$/);
+  if (!match || !match[1]) {
+    return { valid: false, value: 0, unit: 'Y', error: 'Valid Patient Age (1-130) is mandatory for token generation.' };
+  }
+  const value = parseInt(match[1], 10);
+  const unit = (match[2] || 'Y').toUpperCase() as 'M' | 'Y';
+
+  if (unit === 'M') {
+    if (value <= 0 || value > 240) {
+      return { valid: false, value, unit, error: 'Valid Patient Age in months (1-240) is mandatory for token generation.' };
+    }
+  } else {
+    if (value <= 0 || value > 130) {
+      return { valid: false, value, unit, error: 'Valid Patient Age (1-130) is mandatory for token generation.' };
+    }
+  }
+  return { valid: true, value, unit };
+}
+
+/**
+ * Calculates dateOfBirth and ageFallback from parsed age, anchored to Asia/Colombo boundaries.
+ * Clamps days to the target month's maximum to prevent end-of-month JavaScript Date rollover (e.g. March 31 - 11M).
+ */
+export function calculateDobAndFallback(parsed: ParsedAge, referenceDate: Date = new Date()): { dob: Date; ageFallback: number } {
+  const boundaries = getTimezoneBoundaries(referenceDate, 'Asia/Colombo');
+  const ref = new Date(boundaries.startOfDay);
+  const dob = new Date(ref);
+  if (parsed.unit === 'M') {
+    const originalDay = ref.getDate();
+    const targetTotalMonths = ref.getFullYear() * 12 + ref.getMonth() - parsed.value;
+    const targetYear = Math.floor(targetTotalMonths / 12);
+    const targetMonth = ((targetTotalMonths % 12) + 12) % 12;
+    const maxDays = new Date(targetYear, targetMonth + 1, 0).getDate();
+    const clampedDay = Math.min(originalDay, maxDays);
+    dob.setFullYear(targetYear, targetMonth, clampedDay);
+    return { dob, ageFallback: Math.floor(parsed.value / 12) };
+  } else {
+    const originalDay = ref.getDate();
+    const targetYear = ref.getFullYear() - parsed.value;
+    const targetMonth = ref.getMonth();
+    const maxDays = new Date(targetYear, targetMonth + 1, 0).getDate();
+    const clampedDay = Math.min(originalDay, maxDays);
+    dob.setFullYear(targetYear, targetMonth, clampedDay);
+    return { dob, ageFallback: parsed.value };
+  }
+}
+
+/**
+ * Formats patient age for display/API response.
+ * If dob is present and elapsed months < 24: returns `${months}M`.
+ * Otherwise returns years as integer.
+ */
+export function formatPatientAge(
+  dob?: Date | string | null,
+  ageFallback?: number | null,
+  referenceDate: Date = new Date()
+): string | number | null {
+  if (dob) {
+    const birthDate = new Date(dob);
+    if (!isNaN(birthDate.getTime())) {
+      const boundaries = getTimezoneBoundaries(referenceDate, 'Asia/Colombo');
+      const ref = new Date(boundaries.startOfDay);
+      let months = (ref.getFullYear() - birthDate.getFullYear()) * 12 + (ref.getMonth() - birthDate.getMonth());
+      if (ref.getDate() < birthDate.getDate()) {
+        months--;
+      }
+      if (months >= 0 && months < 24) {
+        return `${Math.max(1, months)}M`;
+      }
+      const years = Math.floor(months / 12);
+      return years > 0 ? years : (ageFallback !== null && ageFallback !== undefined ? ageFallback : `${Math.max(1, months)}M`);
+    }
+  }
+  if (ageFallback !== null && ageFallback !== undefined) {
+    return ageFallback;
+  }
+  return null;
+}
+

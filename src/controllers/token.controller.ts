@@ -90,36 +90,18 @@ export const generateToken = async (req: Request, res: Response): Promise<void> 
         }
       });
 
-      let nextSeq = 1;
-      while (usedInts.has(nextSeq)) {
-        const row = existingByNum.get(nextSeq);
-        if (row && (row.status === "CANCELLED" || row.status === "NO_SHOW")) {
-          return tx.appointment.update({
-            where: { id: row.id },
-            data: {
-              patientId,
-              doctorId,
-              status: "CHECKED_IN",
-              calledAt: null,
-              completedAt: null,
-              cancelledAt: null,
-              checkedInAt: new Date(),
-              bookedAt: new Date()
-            },
-            include: {
-              Patient: true,
-              User: { select: { fullName: true } }
-            }
-          });
-        }
-        nextSeq++;
-      }
-
-      if (usedInts.size >= maxWalkInCapacity) {
+      const activeTokensCount = existingTokens.filter(t => t.status !== "CANCELLED" && t.status !== "NO_SHOW").length;
+      if (activeTokensCount >= maxWalkInCapacity) {
         throw new Error("Doctor's walk-in capacity reached for this date");
       }
 
+      let nextSeq = 1;
+      while (usedInts.has(nextSeq)) {
+        nextSeq++;
+      }
+
       const tokenNumber = `${docPrefix}-${nextSeq.toString().padStart(2, "0")}`;
+      const bookingReference = Math.floor(1000000000 + Math.random() * 9000000000).toString();
 
       return tx.appointment.create({
         data: {
@@ -129,6 +111,10 @@ export const generateToken = async (req: Request, res: Response): Promise<void> 
           sessionId: session.id,
           appointmentDate: startOfDay,
           status: "CHECKED_IN",
+          bookingReference,
+          bookingType: "WALK_IN",
+          bookedAt: new Date(),
+          checkedInAt: new Date()
         },
         include: {
           Patient: true,

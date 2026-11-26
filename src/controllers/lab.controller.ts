@@ -96,7 +96,8 @@ export class LabController {
     try {
       const doctorId = req.query.doctorId as string | undefined;
       const type = req.query.type as string | undefined;
-      const requests = await labService.getPendingRequests(doctorId, type);
+      const scope = req.query.scope as string | undefined;
+      const requests = await labService.getPendingRequests(doctorId, type, scope);
       res.json(requests);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -106,7 +107,8 @@ export class LabController {
   async getPublishedReports(req: Request, res: Response) {
     try {
       const doctorId = req.query.doctorId as string | undefined;
-      const reports = await labService.getPublishedReports(doctorId);
+      const scope = req.query.scope as string | undefined;
+      const reports = await labService.getPublishedReports(doctorId, scope);
       res.json(reports);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -287,6 +289,33 @@ export class LabController {
       res.json({ success: true, data: updated });
     } catch (error: any) {
       console.error("updateOutsourceStatus error:", error);
+      res.status(400).json({ success: false, error: error.message });
+    }
+  }
+
+  async recordOutsourceCashout(req: Request, res: Response) {
+    try {
+      const user = (req as any).user;
+      if (!user) return res.status(401).json({ success: false, error: "Unauthorized" });
+
+      const { partnerCenter, requestIds, itemIds, amount, paymentMethod, notes } = req.body;
+      const result = await labService.recordOutsourceCashout({
+        partnerCenter,
+        requestIds: requestIds || [],
+        itemIds: itemIds || [],
+        amount: Number(amount),
+        paymentMethod: paymentMethod || "CASH",
+        notes: notes || undefined,
+        userId: user.id
+      });
+
+      await clearCache('*lab*');
+      await clearCache('*finance*');
+      await clearCache('*reception*');
+
+      res.json(result);
+    } catch (error: any) {
+      console.error("recordOutsourceCashout error:", error);
       res.status(400).json({ success: false, error: error.message });
     }
   }

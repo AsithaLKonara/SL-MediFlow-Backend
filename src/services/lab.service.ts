@@ -47,7 +47,7 @@ export class LabService {
       if (room) targetRoomId = room.id;
     }
 
-    return withRetry(() => prisma.labTest.create({
+    const test = await withRetry(() => prisma.labTest.create({
       data: {
         name: data.name,
         code: data.code,
@@ -67,6 +67,21 @@ export class LabService {
         }
       }
     }));
+
+    // Seed initial forward-only price version
+    await (prisma as any).labTestPriceVersion.create({
+      data: {
+        labTestId: test.id,
+        price: test.price,
+        hospitalCommission: test.hospitalCommission || 0,
+        commissionType: test.commissionType || "FLAT",
+        outsourceCost: test.outsourceCost || 0,
+        effectiveFrom: new Date(),
+        isActive: true,
+      }
+    }).catch(console.error);
+
+    return test;
   }
 
   async updateTestInCatalog(id: string, data: {
@@ -84,6 +99,39 @@ export class LabService {
     outsourcedCenter?: string;
     isActive?: boolean;
   }) {
+    // Audit & version forward-only if financial parameters changed
+    const currentTest = await prisma.labTest.findUnique({ where: { id } });
+    const isPriceChanged = data.price !== undefined && currentTest && data.price !== currentTest.price;
+    const isCommChanged = (data.hospitalCommission !== undefined && currentTest && parseFloat(String(data.hospitalCommission)) !== currentTest.hospitalCommission) ||
+      (data.commissionType !== undefined && currentTest && data.commissionType !== currentTest.commissionType);
+    const isOutsourceCostChanged = data.outsourceCost !== undefined && currentTest && parseFloat(String(data.outsourceCost)) !== currentTest.outsourceCost;
+
+    if (currentTest && (isPriceChanged || isCommChanged || isOutsourceCostChanged)) {
+      // 1. Mark previous active version as superseded
+      await (prisma as any).labTestPriceVersion.updateMany({
+        where: { labTestId: id, isActive: true },
+        data: { isActive: false, effectiveTo: new Date() }
+      }).catch(console.error);
+
+      // 2. Create new forward-only price version record
+      const newPrice = data.price !== undefined ? data.price : currentTest.price;
+      const newComm = data.hospitalCommission !== undefined ? parseFloat(String(data.hospitalCommission)) : (currentTest.hospitalCommission || 0);
+      const newCommType = data.commissionType !== undefined ? data.commissionType : (currentTest.commissionType || "FLAT");
+      const newOutsourceCost = data.outsourceCost !== undefined ? parseFloat(String(data.outsourceCost)) : (currentTest.outsourceCost || 0);
+
+      await (prisma as any).labTestPriceVersion.create({
+        data: {
+          labTestId: id,
+          price: newPrice,
+          hospitalCommission: newComm,
+          commissionType: newCommType,
+          outsourceCost: newOutsourceCost,
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+    }
+
     const updateData: any = {};
     if (data.name !== undefined) updateData.name = data.name;
     if (data.code !== undefined) updateData.code = data.code;
@@ -164,33 +212,110 @@ export class LabService {
         throw new Error("One or more tests not found in catalog");
       }
 
+      let effectiveVisitId: string | null = null;
       let effectiveDoctorId = data.doctorId;
-      if (!effectiveDoctorId && data.visitId) {
-        const apt = await prisma.appointment.findUnique({
-          where: { id: data.visitId },
-          select: { doctorId: true }
+      if (data.visitId) {
+        const apt = await prisma.appointment.findFirst({
+          where: {
+            OR: [
+              { id: data.visitId },
+              { bookingReference: data.visitId }
+            ]
+          },
+          select: { id: true, doctorId: true, bookingReference: true }
         });
-        if (apt?.doctorId) effectiveDoctorId = apt.doctorId;
+        if (apt) {
+          effectiveVisitId = apt.id;
+          if (!effectiveDoctorId && apt.doctorId) {
+            effectiveDoctorId = apt.doctorId;
+          }
+          if (!effectiveDoctorId && apt.bookingReference) {
+            const siblingConsultApt = await prisma.appointment.findFirst({
+              where: {
+                bookingReference: apt.bookingReference,
+                doctorId: { not: null }
+              },
+              select: { doctorId: true }
+            });
+            if (siblingConsultApt?.doctorId) {
+              effectiveDoctorId = siblingConsultApt.doctorId;
+            }
+          }
+        }
       }
 
-      // 1. Create the lab request with items
+      // Deduplication Check: Prevent duplicate lab orders & double billing for same patient in active visit / today
+      const colomboDateStr = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Colombo" });
+      const startOfDay = new Date(`${colomboDateStr}T00:00:00+05:30`);
+      const endOfDay = new Date(`${colomboDateStr}T23:59:59.999+05:30`);
+
+      const existingActiveRequests = await prisma.labRequest.findMany({
+        where: {
+          patientId: data.patientId,
+          status: { not: "CANCELLED" },
+          OR: [
+            ...(effectiveVisitId ? [{ visitId: effectiveVisitId }] : []),
+            ...(data.visitId && data.visitId !== effectiveVisitId ? [{ visitId: data.visitId }] : []),
+            { requestedAt: { gte: startOfDay, lte: endOfDay } }
+          ]
+        },
+        include: {
+          items: {
+            include: { LabTest: true }
+          }
+        }
+      });
+
+      const alreadyOrderedTestIds = new Set<string>();
+      existingActiveRequests.forEach(req => {
+        req.items.forEach(item => {
+          alreadyOrderedTestIds.add(item.labTestId);
+        });
+      });
+
+      const newTests = tests.filter(test => !alreadyOrderedTestIds.has(test.id));
+      const duplicateTests = tests.filter(test => alreadyOrderedTestIds.has(test.id));
+
+      if (newTests.length === 0) {
+        // All requested tests are already booked and active! Skip duplicate creation and charges.
+        console.log(`[LabService] Deduplication: All tests (${duplicateTests.map(t => t.name).join(", ")}) already booked for patient ${data.patientId}. Skipping duplicate charges.`);
+        const primaryExisting = existingActiveRequests[0];
+        return {
+          ...primaryExisting,
+          duplicatePrevented: true,
+          skippedDuplicates: duplicateTests.map(t => t.name),
+          message: `All selected lab tests (${duplicateTests.map(t => t.name).join(", ")}) were already booked for this visit. Existing booking retained without double charging.`
+        };
+      }
+
+      // 1. Create the lab request with items strictly for new (non-duplicate) tests
+      const getTestFinalPrice = (test: any): number => {
+        if (data.customPrices && data.customPrices[test.id] !== undefined) {
+          return Number(data.customPrices[test.id]);
+        }
+        // In the master catalog, test.price is already the full customer selling price
+        // (which for outside tests was saved as: outsourceCost + hospitalCommission).
+        if (test.isOutsideTest) {
+          if (test.price && test.price > (test.outsourceCost || 0)) {
+            return test.price;
+          }
+          // Fallback if price in DB was somehow only the base outsourceCost:
+          return (test.outsourceCost || 0) + (test.hospitalCommission || 0);
+        }
+        return test.price || 0;
+      };
+
+      // 1. Create LabRequest
       const request = await prisma.labRequest.create({
         data: {
           patientId: data.patientId,
           doctorId: effectiveDoctorId,
-          visitId: data.visitId,
+          visitId: effectiveVisitId,
           priority: data.priority || "ROUTINE",
           status: "PENDING",
           items: {
-            create: tests.map(test => {
-              const basePrice = data.customPrices && data.customPrices[test.id] !== undefined 
-                ? Number(data.customPrices[test.id]) 
-                : test.price;
-              
-              const finalPrice = test.isOutsideTest && (test.hospitalCommission || 0) > 0 && !data.customPrices?.[test.id]
-                ? basePrice + (test.hospitalCommission || 0)
-                : basePrice;
-              
+            create: newTests.map(test => {
+              const finalPrice = getTestFinalPrice(test);
               if (finalPrice < 0) throw new Error("Price cannot be negative");
               return {
                 labTestId: test.id,
@@ -204,20 +329,13 @@ export class LabService {
         }
       });
 
-      // 2. Add all charges atomically using bulk billing
+      // 2. Add charges atomically using bulk billing strictly for new (non-duplicate) tests
       if (!data.skipBilling && (data.visitId || data.patientId)) {
         await billingService.addChargesBulk({
           visitId: data.visitId,
           patientId: data.patientId,
-          charges: tests.map(test => {
-            const basePrice = data.customPrices && data.customPrices[test.id] !== undefined
-              ? Number(data.customPrices[test.id])
-              : test.price;
-            
-            const finalPrice = test.isOutsideTest && (test.hospitalCommission || 0) > 0 && !data.customPrices?.[test.id]
-              ? basePrice + (test.hospitalCommission || 0)
-              : basePrice;
-
+          charges: newTests.map(test => {
+            const finalPrice = getTestFinalPrice(test);
             return {
               department: 'LAB',
               referenceId: request.id,
@@ -232,22 +350,36 @@ export class LabService {
       }
 
       websocketService.broadcast("lab_request_created", request);
-      return request;
+      return {
+        ...request,
+        skippedDuplicates: duplicateTests.map(t => t.name)
+      };
     });
   }
 
   /**
    * Get pending lab requests for the technicians
    */
-  async getPendingRequests(doctorId?: string, type?: string) {
+  async getPendingRequests(doctorId?: string, type?: string, scope?: string) {
     const whereClause: any = {
       status: { in: ["PENDING", "SAVED", "IN_PROGRESS"] }
     };
 
-    if (doctorId) {
+    if (doctorId && scope !== "ALL") {
+      const doctorAppointments = await prisma.appointment.findMany({
+        where: { doctorId },
+        select: { bookingReference: true, patientId: true }
+      });
+      const bookingRefs = doctorAppointments
+        .map(a => a.bookingReference)
+        .filter((ref): ref is string => Boolean(ref));
+      const patientIds = Array.from(new Set(doctorAppointments.map(a => a.patientId).filter(Boolean)));
+
       whereClause.OR = [
         { doctorId },
-        { Visit: { doctorId } }
+        { Visit: { doctorId } },
+        ...(bookingRefs.length > 0 ? [{ Visit: { bookingReference: { in: bookingRefs } } }] : []),
+        ...(patientIds.length > 0 ? [{ patientId: { in: patientIds } }] : [])
       ];
     }
 
@@ -255,14 +387,18 @@ export class LabService {
       whereClause.items = {
         some: { LabTest: { isOutsideTest: true } }
       };
-    } else if (type === "IN_HOUSE" || !type) {
-      // Default for technicians' workbench: only in-house hospital tests
+    } else if (type === "IN_HOUSE") {
+      whereClause.items = {
+        some: { LabTest: { isOutsideTest: false } }
+      };
+    } else if (!type && !doctorId) {
+      // Default for technicians workbench only when doctorId is not specified
       whereClause.items = {
         some: { LabTest: { isOutsideTest: false } }
       };
     }
 
-    return withRetry(() => prisma.labRequest.findMany({
+    const requests = await withRetry(() => prisma.labRequest.findMany({
       where: whereClause,
       include: {
         items: {
@@ -275,6 +411,20 @@ export class LabService {
       },
       orderBy: { requestedAt: 'asc' }
     }));
+
+    return requests.map(req => ({
+      ...req,
+      tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+      barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+      patientPhone: req.Patient?.phone || null
+    }));
+  }
+
+  /**
+   * Alias for getPendingRequests to satisfy getLabRequests contract
+   */
+  async getLabRequests(doctorId?: string, type?: string, scope?: string) {
+    return this.getPendingRequests(doctorId, type, scope);
   }
 
   /**
@@ -419,18 +569,30 @@ export class LabService {
   /**
    * Get all completed (published) lab requests
    */
-  async getPublishedReports(doctorId?: string) {
+  async getPublishedReports(doctorId?: string, scope?: string) {
     return withRetry(async () => {
+      const whereCondition: any = { status: "COMPLETED" };
+
+      if (doctorId && scope !== "ALL") {
+        const doctorAppointments = await prisma.appointment.findMany({
+          where: { doctorId },
+          select: { bookingReference: true, patientId: true }
+        });
+        const bookingRefs = doctorAppointments
+          .map(a => a.bookingReference)
+          .filter((ref): ref is string => Boolean(ref));
+        const patientIds = Array.from(new Set(doctorAppointments.map(a => a.patientId).filter(Boolean)));
+
+        whereCondition.OR = [
+          { doctorId },
+          { Visit: { doctorId } },
+          ...(bookingRefs.length > 0 ? [{ Visit: { bookingReference: { in: bookingRefs } } }] : []),
+          ...(patientIds.length > 0 ? [{ patientId: { in: patientIds } }] : [])
+        ];
+      }
+
       const reports = await prisma.labRequest.findMany({
-        where: doctorId
-          ? {
-              status: "COMPLETED",
-              OR: [
-                { doctorId },
-                { Visit: { doctorId } }
-              ]
-            }
-          : { status: "COMPLETED" },
+        where: whereCondition,
         include: {
           items: {
             include: { LabTest: { include: { biomarkers: { orderBy: { orderIndex: 'asc' } }, room: true } } }
@@ -448,6 +610,8 @@ export class LabService {
         if (report.reportUrl && S3Service.isS3Url(report.reportUrl)) {
           const presignedUrl = await S3Service.generateDownloadUrl(report.reportUrl);
           if (presignedUrl) report.reportUrl = presignedUrl;
+        } else if (!report.reportUrl) {
+          report.reportUrl = `/reports/${report.id.slice(0, 8).toUpperCase()}`;
         }
       }
 
@@ -460,11 +624,10 @@ export class LabService {
    */
     async getMetrics() {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-
-      const yesterday = new Date(today);
-      yesterday.setDate(yesterday.getDate() - 1);
+      const { startOfDay: today } = getTimezoneBoundaries();
+      const yesterdayDate = new Date();
+      yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+      const { startOfDay: yesterday } = getTimezoneBoundaries(yesterdayDate);
 
       // Pending (currently waiting)
       const pendingCount = await prisma.labRequest.count({
@@ -568,6 +731,9 @@ export class LabService {
         tables: {
           urgentRequests: urgentPending.map(req => ({
             id: req.id,
+            tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+            barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+            patientPhone: req.Patient?.phone || null,
             patientName: req.Patient?.fullName || `Patient ${req.patientId.slice(0, 4)}`,
             doctor: req.Visit?.User?.fullName || "Unknown Doctor",
             tests: req.items.map(i => i.LabTest?.name),
@@ -580,6 +746,9 @@ export class LabService {
             // but if reportUrl is S3 we could transform it. We'll leave metrics raw for speed
             return {
               id: req.id,
+              tokenNumber: req.Visit?.tokenNumber ? String(req.Visit.tokenNumber) : null,
+              barcode: req.Visit?.bookingReference || (req as any).barcode || null,
+              patientPhone: req.Patient?.phone || null,
               patientName: req.Patient?.fullName || `Patient ${req.patientId.slice(0, 4)}`,
               doctor: req.Visit?.User?.fullName || "Unknown Doctor",
               tests: req.items.map(i => i.LabTest?.name),
@@ -590,6 +759,13 @@ export class LabService {
         }
       };
     });
+  }
+
+  /**
+   * Alias for getMetrics to satisfy getLabMetrics contract
+   */
+  async getLabMetrics() {
+    return this.getMetrics();
   }
 
   /**
@@ -673,8 +849,7 @@ export class LabService {
    */
   async getRequestByToken(tokenOrBarcode: string) {
     return withRetry(async () => {
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
+      const { startOfDay: today } = getTimezoneBoundaries();
       const code = (tokenOrBarcode || "").trim();
 
       if (!code) {
@@ -715,6 +890,7 @@ export class LabService {
           const apptIds = allAppointments.map(a => a.id);
           allLabRequests = await prisma.labRequest.findMany({
             where: {
+              status: { not: "CANCELLED" },
               OR: [
                 { visitId: { in: apptIds } },
                 { patientId: directLabReq.patientId, requestedAt: { gte: today } }
@@ -824,9 +1000,10 @@ export class LabService {
 
       const allApptIds = allAppointments.map(a => a.id);
 
-      // Fetch all LabRequests across all visit appointments or created for this patient today
+      // Fetch all non-cancelled LabRequests across all visit appointments or created for this patient today
       const allLabRequests = await prisma.labRequest.findMany({
         where: {
+          status: { not: "CANCELLED" },
           OR: [
             { visitId: { in: allApptIds } },
             {
@@ -899,8 +1076,7 @@ export class LabService {
    */
   async getOutsourceDailyReports(dateStr?: string, centerFilter?: string, searchStr?: string) {
     return withRetry(async () => {
-      const targetDate = dateStr ? new Date(dateStr) : undefined;
-      const { startOfDay, endOfDay } = getTimezoneBoundaries(targetDate);
+      const { startOfDay, endOfDay } = getTimezoneBoundaries(dateStr || undefined);
       const cleanSearch = (searchStr || "").trim();
 
       // Base date condition (today / selected date)
@@ -986,9 +1162,11 @@ export class LabService {
             ? lt.outsourceCost
             : (it.price || lt.price || 0) * 0.75; // fallback 75% cost if unset
 
-          let hospitalMarkup = lt.hospitalCommission || 0;
-          if (lt.commissionType === "PERCENTAGE" && hospitalMarkup > 0) {
-            hospitalMarkup = (actualCost * hospitalMarkup) / 100;
+          const isPercentage = (lt.commissionType || "").toUpperCase() === "PERCENT" || (lt.commissionType || "").toUpperCase() === "PERCENTAGE";
+          const rawCommRate = lt.hospitalCommission !== null && lt.hospitalCommission !== undefined ? lt.hospitalCommission : 0;
+          let hospitalMarkup = rawCommRate;
+          if (isPercentage && rawCommRate > 0) {
+            hospitalMarkup = Math.round(((actualCost * rawCommRate) / 100) * 100) / 100;
           }
 
           const customerPrice = it.price || lt.price || (actualCost + hospitalMarkup);
@@ -1027,14 +1205,21 @@ export class LabService {
             category: lt.category || "External Pathology",
             outsourcedCenter: centerName,
             outsourceCost: actualCost,
-            commissionType: lt.commissionType || "FLAT",
+            commissionType: isPercentage ? "PERCENTAGE" : "FLAT",
+            commissionRate: rawCommRate,
+            hospitalCommission: hospitalMarkup,
             hospitalMarkup,
             customerPrice,
             profit,
             status: currentStatus,
             reportUrl: req.reportUrl,
             handedOverAt: req.handedOverAt,
-            handedOverBy: req.handedOverBy
+            handedOverBy: req.handedOverBy,
+            outsourcePaid: (req as any).outsourcePaid || false,
+            outsourcePaidAt: (req as any).outsourcePaidAt || null,
+            outsourceReceiptNo: (req as any).outsourceReceiptNo || null,
+            outsourcePaidTo: (req as any).outsourcePaidTo || null,
+            outsourcePaidCost: (req as any).outsourcePaidCost || null
           });
         }
       }
@@ -1093,6 +1278,113 @@ export class LabService {
           items: { include: { LabTest: true } }
         }
       });
+    });
+  }
+
+  /**
+   * Cashout to Outsource Lab Partner and update financial records / drawer expense
+   */
+  async recordOutsourceCashout(data: {
+    partnerCenter: string;
+    requestIds: string[];
+    itemIds?: string[];
+    amount: number;
+    paymentMethod?: string;
+    notes?: string;
+    userId: string;
+  }) {
+    return withRetry(async () => {
+      const numAmount = Number(data.amount);
+      if (!numAmount || isNaN(numAmount) || numAmount <= 0) {
+        throw new Error("A valid positive cashout amount is required.");
+      }
+
+      if (!data.partnerCenter || !data.partnerCenter.trim()) {
+        throw new Error("Outsource laboratory partner name is required.");
+      }
+
+      if (!data.requestIds || data.requestIds.length === 0) {
+        throw new Error("At least one outsource test request must be selected for cashout.");
+      }
+
+      // Check if user has an active open cash register shift
+      const shift = await prisma.cashRegisterShift.findFirst({
+        where: { openedBy: data.userId, status: "OPEN" },
+        orderBy: { openedAt: "desc" }
+      });
+
+      // Generate unique receipt number: EXP-OUT-YYYYMMDD-XXXX
+      const now = new Date();
+      const datePrefix = now.toISOString().slice(0, 10).replace(/-/g, "");
+      const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
+      const receiptNumber = `EXP-OUT-${datePrefix}-${randomSuffix}`;
+
+      // 1. Create Expense record in finance
+      const expense = await prisma.expense.create({
+        data: {
+          category: "OUTSOURCE_LAB",
+          amount: numAmount,
+          description: `Outsource Lab Payout: ${data.partnerCenter} - ${data.requestIds.length} test(s) [${receiptNumber}]${data.notes ? ` (Note: ${data.notes})` : ""}`,
+          paymentMethod: data.paymentMethod || "CASH",
+          shiftId: shift?.id || null,
+          userId: data.userId,
+          receiptNumber,
+          date: now,
+          status: "COMPLETED"
+        }
+      });
+
+      // 2. Mark matching LabRequests as paid and auto-advance status to SENT_TO_LAB (DEFECT-LAB-01)
+      await prisma.labRequest.updateMany({
+        where: {
+          id: { in: data.requestIds },
+          OR: [
+            { outsourceStatus: "SAMPLE_COLLECTED" },
+            { outsourceStatus: null }
+          ]
+        },
+        data: {
+          outsourcePaid: true,
+          outsourcePaidAt: now,
+          outsourceReceiptNo: receiptNumber,
+          outsourcePaidTo: data.partnerCenter,
+          outsourcePaidCost: numAmount,
+          outsourceStatus: "SENT_TO_LAB"
+        }
+      });
+
+      // Update payment details for any requests already beyond SAMPLE_COLLECTED
+      await prisma.labRequest.updateMany({
+        where: {
+          id: { in: data.requestIds },
+          outsourceStatus: { notIn: ["SAMPLE_COLLECTED", "SENT_TO_LAB"] }
+        },
+        data: {
+          outsourcePaid: true,
+          outsourcePaidAt: now,
+          outsourceReceiptNo: receiptNumber,
+          outsourcePaidTo: data.partnerCenter,
+          outsourcePaidCost: numAmount
+        }
+      });
+
+      websocketService.broadcast("outsource_lab_updated", {
+        requestIds: data.requestIds,
+        partnerCenter: data.partnerCenter,
+        receiptNumber,
+        status: "SENT_TO_LAB"
+      });
+
+      return {
+        success: true,
+        receiptNumber,
+        expenseId: expense.id,
+        partnerCenter: data.partnerCenter,
+        amount: numAmount,
+        shiftId: shift?.id || null,
+        paidAt: now,
+        count: data.requestIds.length
+      };
     });
   }
 }

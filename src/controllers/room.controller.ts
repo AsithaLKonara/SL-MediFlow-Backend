@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { roomService } from '../services/room.service.js';
 import { prisma } from '../lib/prisma.js';
+import { getTimezoneBoundaries } from '../lib/dateUtils.js';
 
 export class RoomController {
   async getAllRooms(req: Request, res: Response) {
@@ -66,12 +67,7 @@ export class RoomController {
       if (!date) return res.status(400).json({ error: "Date is required" });
 
       const dateStr = (date as string).includes('T') ? (date as string).split('T')[0] : (date as string);
-      const targetDate = new Date(`${dateStr}T00:00:00`);
-      const startOfDay = new Date(targetDate);
-      startOfDay.setHours(0, 0, 0, 0);
-      const endOfDay = new Date(targetDate);
-      endOfDay.setHours(23, 59, 59, 999);
-      const dayOfWeek = startOfDay.getDay(); // 0=Sun, 1=Mon...
+      const { startOfDay, endOfDay, dayOfWeek } = getTimezoneBoundaries(dateStr);
 
       // 1. Fetch all rooms
       const actualRooms = await roomService.getAllRooms();

@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
 import bcrypt from "bcryptjs";
+import { validatePasswordStrength } from "../utils/password.util.js";
 import { clearCache } from "../middlewares/cache.middleware.js";
 import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
@@ -115,6 +116,13 @@ export const createStaff = async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: "Only Doctors can be assigned to a department" });
     }
 
+    if (password) {
+      const validation = validatePasswordStrength(password);
+      if (!validation.isValid) {
+        return res.status(400).json({ success: false, error: validation.message });
+      }
+    }
+
     const normalizedEmail = email.trim().toLowerCase();
 
     const salt = await bcrypt.genSalt(10);
@@ -213,6 +221,34 @@ export const updateStaff = async (req: Request, res: Response) => {
     if (feeType !== undefined) data.feeType = feeType || "POST";
     if (commissionRate !== undefined) data.commissionRate = commissionRate !== null ? parseFloat(commissionRate) : 20;
     if (commissionType !== undefined) data.commissionType = commissionType || "PERCENTAGE";
+
+    // Forward-only doctor fee/commission versioning
+    const currentDoc = await prisma.user.findUnique({ where: { id: id as string } });
+    const isFeeChanged = consultationFee !== undefined && currentDoc && (consultationFee ? parseFloat(consultationFee) : null) !== currentDoc.consultationFee;
+    const isCommRateChanged = commissionRate !== undefined && currentDoc && (commissionRate !== null ? parseFloat(commissionRate) : 20) !== currentDoc.commissionRate;
+    const isCommTypeChanged = commissionType !== undefined && currentDoc && (commissionType || "PERCENTAGE") !== currentDoc.commissionType;
+
+    if (currentDoc && (isFeeChanged || isCommRateChanged || isCommTypeChanged)) {
+      await (prisma as any).doctorFeeVersion.updateMany({
+        where: { doctorId: id as string, isActive: true },
+        data: { isActive: false, effectiveTo: new Date() }
+      }).catch(console.error);
+
+      const newFee = consultationFee !== undefined ? (consultationFee ? parseFloat(consultationFee) : 0) : (currentDoc.consultationFee || 0);
+      const newRate = commissionRate !== undefined ? (commissionRate !== null ? parseFloat(commissionRate) : 20) : (currentDoc.commissionRate || 20);
+      const newType = commissionType !== undefined ? (commissionType || "PERCENTAGE") : (currentDoc.commissionType || "PERCENTAGE");
+
+      await (prisma as any).doctorFeeVersion.create({
+        data: {
+          doctorId: id as string,
+          consultationFee: newFee,
+          commissionRate: newRate,
+          commissionType: newType,
+          effectiveFrom: new Date(),
+          isActive: true
+        }
+      }).catch(console.error);
+    }
 
     const updatedStaff = await prisma.user.update({
       where: { id: id as string },
@@ -389,10 +425,8 @@ export const getRoomSchedules = async (req: Request, res: Response) => {
     const startStr = (startDate as string).includes('T') ? (startDate as string).split('T')[0] : (startDate as string);
     const endStr = (endDate as string).includes('T') ? (endDate as string).split('T')[0] : (endDate as string);
 
-    const start = new Date(`${startStr}T00:00:00`);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(`${endStr}T00:00:00`);
-    end.setHours(23, 59, 59, 999);
+    const start = getTimezoneBoundaries(startStr).startOfDay;
+    const end = getTimezoneBoundaries(endStr).endOfDay;
 
     const room = await prisma.room.findUnique({ where: { id: roomId } });
     if (!room) return res.status(404).json({ success: false, error: "Room not found" });
@@ -437,22 +471,18 @@ export const getRoomSchedules = async (req: Request, res: Response) => {
       const daySessions = sessions.filter(s => s.dayOfWeek === dayIndex);
       
       for (const s of daySessions) {
-         const validFrom = new Date(s.schedule.validFrom);
-         validFrom.setHours(0, 0, 0, 0);
+         const { startOfDay: validFrom } = getTimezoneBoundaries(s.schedule.validFrom);
          if (currentDate < validFrom) continue;
          
          if (s.schedule.validUntil) {
-            const validUntil = new Date(s.schedule.validUntil);
-            validUntil.setHours(23, 59, 59, 999);
+            const { endOfDay: validUntil } = getTimezoneBoundaries(s.schedule.validUntil);
             if (currentDate > validUntil) continue;
          }
 
          // Check leave
          const onLeave = s.schedule.leaves?.some(l => {
-           const lStart = new Date(l.startDate);
-           lStart.setHours(0, 0, 0, 0);
-           const lEnd = new Date(l.endDate);
-           lEnd.setHours(23, 59, 59, 999);
+           const { startOfDay: lStart } = getTimezoneBoundaries(l.startDate);
+           const { endOfDay: lEnd } = getTimezoneBoundaries(l.endDate);
            return currentDate >= lStart && currentDate <= lEnd;
          });
          if (onLeave) continue;
@@ -487,6 +517,24 @@ export const getRoomSchedules = async (req: Request, res: Response) => {
     });
 
     res.json({ success: true, data: results });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+export const getNotificationLogs = async (req: Request, res: Response) => {
+  try {
+    const { patientId, phone, limit = 50 } = req.query;
+    const where: any = {};
+    if (patientId) where.patientId = patientId as string;
+    if (phone) where.phoneNumber = phone as string;
+
+    const logs = await prisma.notificationJob.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: Number(limit)
+    });
+    res.json({ success: true, data: logs });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }

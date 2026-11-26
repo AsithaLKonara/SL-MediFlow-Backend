@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma.js";
 import { SMSService } from "../services/sms.service.js";
 import { NotificationService } from "../services/notification.service.js";
 import { S3Service } from "../services/s3.service.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 import jwt from "jsonwebtoken";
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -39,7 +40,8 @@ export const requestOTP = async (req: Request, res: Response) => {
 
     // Generate real secure 6-digit OTP
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 mins
+    const OTP_EXPIRY_MINUTES = 5;
+    const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000); // 5 mins (DEFECT-PORT-01 aligned with SMS text)
 
     await prisma.patientOTP.upsert({
       where: { phone: targetPhone },
@@ -55,12 +57,13 @@ export const requestOTP = async (req: Request, res: Response) => {
       { otp }
     ).catch((err) => {
       console.error("Failed to send portal OTP SMS:", err);
-      SMSService.sendSMS(targetPhone, `SL Medi Flow: Your verification code is ${otp}. Valid for 5 minutes. Do not share this OTP with anyone.`).catch(() => {});
+      SMSService.sendSMS(targetPhone, `SL Medi Flow: Your verification code is ${otp}. Valid for ${OTP_EXPIRY_MINUTES} minutes. Do not share this OTP with anyone.`).catch(() => {});
     });
 
     res.json({ 
       success: true, 
       message: "Verification code sent successfully via SMS",
+      expiresInSeconds: OTP_EXPIRY_MINUTES * 60,
       patients: patients.length > 1 ? patients : undefined
     });
   } catch (error: any) {
@@ -98,9 +101,29 @@ export const verifyOTP = async (req: Request, res: Response) => {
       return res.status(400).json({ error: "OTP has expired. Please request a new code." });
     }
 
+    // Check if already reached max attempts
+    if (record.attempts >= 5) {
+      await prisma.patientOTP.delete({ where: { id: record.id } }).catch(() => {});
+      return res.status(429).json({ error: "Too many failed attempts. For your security, this verification code has been invalidated. Please request a new code." });
+    }
+
     const inputCode = String(otp).trim();
     if (record.code !== inputCode) {
-      return res.status(400).json({ error: "Invalid verification code. Please check your SMS and try again." });
+      const newAttempts = record.attempts + 1;
+      if (newAttempts >= 5) {
+        await prisma.patientOTP.delete({ where: { id: record.id } }).catch(() => {});
+        return res.status(429).json({ error: "Too many failed attempts. For your security, this verification code has been invalidated. Please request a new code." });
+      }
+
+      await prisma.patientOTP.update({
+        where: { id: record.id },
+        data: { attempts: { increment: 1 } }
+      }).catch(() => {});
+
+      const remaining = 5 - newAttempts;
+      return res.status(400).json({
+        error: `Invalid verification code. You have ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`
+      });
     }
 
     // Delete used OTP
@@ -172,10 +195,7 @@ export const getPatientHistory = async (req: Request, res: Response) => {
 
     // 3. Time boundaries for today's active visits
     const today = new Date();
-    const startOfDay = new Date(today);
-    startOfDay.setHours(0, 0, 0, 0);
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const { startOfDay, endOfDay } = getTimezoneBoundaries(today);
 
     // 4. Fetch all family members sharing this contact phone
     const familyPatients = await prisma.patient.findMany({

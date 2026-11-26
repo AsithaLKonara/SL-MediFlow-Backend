@@ -176,16 +176,103 @@ export const extraServiceOrderController = {
           }
         }
 
+        // Idempotency: For standard clinical extra services, check if active order already exists for this visit & service
+        if (!createdOrder && !isCertificate && (targetVisitId || targetPatientId)) {
+          const { startOfDay, endOfDay } = getTimezoneBoundaries();
+          const existingOrder = await prisma.extraServiceOrder.findFirst({
+            where: {
+              serviceId: service.id,
+              status: { not: "CANCELLED" },
+              OR: [
+                ...(targetVisitId ? [{ visitId: targetVisitId }] : []),
+                ...(item.id ? [{ id: item.id }] : []),
+                ...(targetPatientId ? [{ patientId: targetPatientId, createdAt: { gte: startOfDay, lte: endOfDay } }] : [])
+              ]
+            },
+            include: {
+              service: true,
+              patient: {
+                select: {
+                  id: true,
+                  patientId: true,
+                  fullName: true,
+                  phone: true,
+                  gender: true,
+                  ageFallback: true
+                }
+              },
+              doctor: {
+                select: {
+                  id: true,
+                  fullName: true,
+                  specialty: true
+                }
+              }
+            }
+          });
+
+          if (existingOrder) {
+            createdOrder = await prisma.extraServiceOrder.update({
+              where: { id: existingOrder.id },
+              data: {
+                customPrice: (item.customPrice !== undefined && item.customPrice !== null) ? Number(item.customPrice) : existingOrder.customPrice,
+                finalPrice: effectivePrice,
+                notes: item.notes || existingOrder.notes,
+                doctorId: targetDoctorId || existingOrder.doctorId,
+                visitId: targetVisitId || existingOrder.visitId
+              },
+              include: {
+                service: true,
+                patient: {
+                  select: {
+                    id: true,
+                    patientId: true,
+                    fullName: true,
+                    phone: true,
+                    gender: true,
+                    ageFallback: true
+                  }
+                },
+                doctor: {
+                  select: {
+                    id: true,
+                    fullName: true,
+                    specialty: true
+                  }
+                }
+              }
+            });
+          }
+        }
+
         if (!createdOrder) {
+          const finalDoctorId = targetDoctorId || service.doctorId || null;
+          const commType = service.doctorCommissionType || "PERCENTAGE";
+          const commRate = service.doctorCommissionRate || 0;
+          let docShare = 0;
+          let hospShare = effectivePrice;
+          if (finalDoctorId && commRate > 0) {
+            if (commType === "FLAT") {
+              docShare = Math.min(effectivePrice, commRate);
+            } else {
+              docShare = Math.round(effectivePrice * (commRate / 100) * 100) / 100;
+            }
+            hospShare = Math.max(0, Math.round((effectivePrice - docShare) * 100) / 100);
+          }
+
           createdOrder = await prisma.extraServiceOrder.create({
             data: {
               orderNumber,
               serviceId: service.id,
               patientId: targetPatientId,
-              doctorId: targetDoctorId,
+              doctorId: finalDoctorId,
               visitId: targetVisitId,
               customPrice: (item.customPrice !== undefined && item.customPrice !== null) ? Number(item.customPrice) : null,
               finalPrice: effectivePrice,
+              doctorCommissionType: commType,
+              doctorCommissionRate: commRate,
+              doctorShare: docShare,
+              hospitalShare: hospShare,
               status: resolvedStatus,
               completedAt: isCompleted ? new Date() : null,
               notes: item.notes || null,
@@ -268,12 +355,10 @@ export const extraServiceOrderController = {
       if (startDate || endDate) {
         where.createdAt = {};
         if (startDate) {
-          where.createdAt.gte = new Date(String(startDate));
+          where.createdAt.gte = getTimezoneBoundaries(String(startDate)).startOfDay;
         }
         if (endDate) {
-          const end = new Date(String(endDate));
-          end.setHours(23, 59, 59, 999);
-          where.createdAt.lte = end;
+          where.createdAt.lte = getTimezoneBoundaries(String(endDate)).endOfDay;
         }
       }
 

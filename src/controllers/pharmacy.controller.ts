@@ -99,9 +99,30 @@ export class PharmacyController {
     }
   }
 
+  async repriceBatch(req: Request, res: Response) {
+    try {
+      const { batchId } = req.params;
+      const { unitPrice, reason } = req.body;
+
+      if (!batchId || unitPrice === undefined || Number(unitPrice) < 0) {
+        return res.status(400).json({ error: "batchId and non-negative unitPrice are required." });
+      }
+
+      const result = await pharmacyService.repriceStockBatch(
+        batchId as string,
+        Number(unitPrice),
+        reason as string | undefined
+      );
+
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   async dispense(req: Request, res: Response) {
     try {
-      const { medicineId, quantity, visitId, patientId, description } = req.body;
+      const { medicineId, quantity, visitId, patientId, description, isSyrup, syrupVolumeMl, dispensedMl } = req.body;
       
       if (!medicineId || quantity === undefined) {
         return res.status(400).json({ error: "Missing medicineId or quantity" });
@@ -112,6 +133,10 @@ export class PharmacyController {
         return res.status(400).json({ error: "Quantity must be a positive number" });
       }
 
+      const effectiveDispensedMl = dispensedMl !== undefined
+        ? Number(dispensedMl)
+        : (isSyrup ? Number(syrupVolumeMl || quantity) : undefined);
+
       const result = await pharmacyService.dispenseMedicine(
         medicineId, 
         qty,
@@ -119,7 +144,9 @@ export class PharmacyController {
           visitId,
           patientId,
           description
-        }
+        },
+        undefined,
+        effectiveDispensedMl
       );
       
       res.json(result);
@@ -141,13 +168,24 @@ export class PharmacyController {
   async updateMedicine(req: Request, res: Response) {
     try {
       const { id } = req.params;
-      const { name, genericName, category, form, strength, unit, packSize, reorderLevel, barcode } = req.body;
+      const { name, genericName, category, form, strength, unit, packSize, reorderLevel, barcode, retailPrice } = req.body;
 
       if (barcode && !/^\d{10}$/.test(barcode)) {
         return res.status(400).json({ error: "Barcode must be exactly 10 digits." });
       }
 
-      const medicine = await pharmacyService.updateMedicine(id as string, { name, genericName, category, form, strength, unit, packSize: packSize !== undefined ? Number(packSize) : undefined, reorderLevel: reorderLevel ? Number(reorderLevel) : undefined, barcode });
+      const medicine = await pharmacyService.updateMedicine(id as string, {
+        name,
+        genericName,
+        category,
+        form,
+        strength,
+        unit,
+        packSize: packSize !== undefined ? Number(packSize) : undefined,
+        reorderLevel: reorderLevel ? Number(reorderLevel) : undefined,
+        barcode,
+        retailPrice: retailPrice !== undefined ? Number(retailPrice) : undefined
+      });
       res.json(medicine);
     } catch (error: any) {
       if (error.code === 'P2002') {
@@ -187,23 +225,59 @@ export class PharmacyController {
 
         for (const item of items) {
           const qty = Number(item.qty);
+          let isSyrup = item.isSyrup;
+          if (isSyrup === undefined) {
+            const medRecord = await tx.medicine.findUnique({
+              where: { id: item.id },
+              select: { form: true, unit: true, packSize: true }
+            });
+            isSyrup = medRecord && (
+              ['syrup', 'suspension', 'liquid'].includes(medRecord.form?.trim().toLowerCase() || '') ||
+              (medRecord.unit?.trim().toLowerCase() === 'bottle' && (medRecord.packSize || 1) > 1)
+            );
+          }
+          // For syrups the POS sends isSyrup=true + syrupVolumeMl (or qty in ml); convert ml → bottles for stock deduction
+          const dispensedMl = isSyrup && (item.syrupVolumeMl || item.qty) ? Number(item.syrupVolumeMl || item.qty) : undefined;
+
           // Delegate to pharmacyService to ensure row-level locks and FIFO logic are applied securely
           const dispenseResult = await pharmacyService.dispenseMedicine(
             item.id,
             qty,
             { skipBilling: true }, // We do our own bulk billing here
-            tx
+            tx,
+            dispensedMl  // <-- syrup-aware parameter
           );
 
-          const itemQty = Number(item.qty) || 1;
-          const unitPrice = itemQty > 0 ? Number((dispenseResult.totalCost / itemQty).toFixed(2)) : dispenseResult.totalCost;
+          // For syrups: totalCost is already computed as (dispensedMl × pricePerMl) by the service
+          // For solids: use the classic qty-averaged unitPrice
+          let chargeQty: number;
+          let chargeUnitPrice: number;
+          if (dispensedMl && dispensedMl > 0) {
+            // Bill as: 1 line × totalCost (keeps invoice description clean)
+            chargeQty = 1;
+            chargeUnitPrice = dispenseResult.totalCost;
+          } else {
+            chargeQty = qty || 1;
+            chargeUnitPrice = chargeQty > 0 ? Number((dispenseResult.totalCost / chargeQty).toFixed(2)) : dispenseResult.totalCost;
+          }
+
+          // Build a human-readable description for syrups: "Paracetamol Syrup - 25 ml @ LKR 5.00/ml"
+          let chargeDescription = item.name || 'Pharmacy Medication';
+          if (dispensedMl && dispenseResult.packSize && dispenseResult.packSize > 1) {
+            const bottlePrice = dispenseResult.batchesUsed.length > 0
+              ? (dispenseResult.batchesUsed.reduce((s: number, b: any) => s + (b.quantityDispensed * b.unitPrice), 0) /
+                 dispenseResult.batchesUsed.reduce((s: number, b: any) => s + b.quantityDispensed, 0))
+              : 0;
+            const pricePerMl = Number((bottlePrice / dispenseResult.packSize).toFixed(2));
+            chargeDescription = `${item.name} - ${dispensedMl} ml @ LKR ${pricePerMl.toFixed(2)}/ml`;
+          }
 
           charges.push({
             department: 'PHARMACY',
             referenceId: item.id,
-            description: item.name || 'Pharmacy Medication',
-            quantity: itemQty,
-            unitPrice: unitPrice,
+            description: chargeDescription,
+            quantity: chargeQty,
+            unitPrice: chargeUnitPrice,
             medicineId: item.id,
           });
         }

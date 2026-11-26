@@ -19,6 +19,9 @@ export class SMSService {
    * Cleans and formats phone numbers to Sri Lanka international standard (947XXXXXXXX)
    */
   public static formatPhoneNumber(phone: string): string {
+    if (!phone || phone.startsWith('WALKIN') || phone.startsWith('NO-PHONE') || phone.startsWith('NO_PHONE')) {
+      return '';
+    }
     let cleaned = (phone || '').replace(/[^0-9]/g, '');
     if (cleaned.startsWith('0')) {
       cleaned = '94' + cleaned.slice(1);
@@ -34,6 +37,9 @@ export class SMSService {
    * @param message Message body
    */
   public static async sendSMS(to: string, message: string): Promise<boolean> {
+    if (!to || to.startsWith('WALKIN') || to.startsWith('NO-PHONE') || to.startsWith('NO_PHONE')) {
+      return false;
+    }
     const apiKey = this.getApiKey();
     if (!apiKey) {
       console.warn('SMS skipped: TEXTLK_API_TOKEN is not defined in environment variables.');
@@ -173,6 +179,9 @@ Time: ${time}`;
    * @param fullName Patient's full name
    */
   public static async syncContact(phone: string, fullName: string): Promise<boolean> {
+    if (!phone || phone.startsWith('WALKIN') || phone.startsWith('NO-PHONE') || phone.startsWith('NO_PHONE')) {
+      return false;
+    }
     const apiKey = this.getApiKey();
     if (!apiKey) return false;
 

@@ -14,6 +14,7 @@ router.patch('/medicines/:id', pharmacyController.updateMedicine.bind(pharmacyCo
 router.delete('/medicines/:id', pharmacyController.deleteMedicine.bind(pharmacyController));
 
 router.post('/stock', pharmacyController.addStockBatch);
+router.put('/stock/batches/:batchId/reprice', pharmacyController.repriceBatch.bind(pharmacyController));
 router.post('/dispense', pharmacyController.dispense);
 
 router.get('/alerts', pharmacyController.getAlerts);

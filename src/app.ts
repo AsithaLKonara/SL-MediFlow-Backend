@@ -19,8 +19,6 @@ const allowedOrigins = [
     "http://medi.xonitspace.com",
     "https://slmediflow.lk",
     "https://www.slmediflow.lk",
-    "https://amazhospital.lk",
-    "https://www.amazhospital.lk",
     "http://localhost:3000",
     "http://localhost:3001",
     "http://localhost:3002",
@@ -39,7 +37,6 @@ app.use(
                 origin.endsWith(".up.railway.app") ||
                 origin.endsWith(".vercel.app") ||
                 origin.endsWith(".slmediflow.lk") ||
-                origin.endsWith(".amazhospital.lk") ||
                 origin.endsWith(".onrender.com");
 
             if (isAllowed || process.env.NODE_ENV !== "production") {
@@ -117,7 +114,6 @@ app.use("/api/finance", financeRoutes);
 app.use("/api/prescriptions", prescriptionRoutes);
 app.use("/api/barcode", barcodeRoutes);
 app.use("/api/auth", authRoutes);
-app.patch("/api/testpatch/:id", (req, res) => { res.send("OK"); });
 app.use("/api/patients", patientRoutes);
 app.use("/api/tokens", tokenRoutes);
 app.use("/api/users", userRoutes);
@@ -144,8 +140,13 @@ app.use((req, res) => {
 
 // Global error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-    console.error(err);
-    res.status(500).json({ success: false, error: "Internal server error", details: err.message });
+    console.error("Unhandled API Error:", err);
+    const isProduction = process.env.NODE_ENV === "production";
+    res.status(err.status || 500).json({
+        success: false,
+        error: isProduction ? "Internal server error" : (err.message || "Internal server error"),
+        ...(isProduction ? {} : { details: err.stack || err.message })
+    });
 });
 
 export default app;

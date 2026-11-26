@@ -1,22 +1,18 @@
 import { Request, Response } from "express";
 import { prisma } from "../lib/prisma.js";
+import { getTimezoneBoundaries } from "../lib/dateUtils.js";
 
 export const getDashboardStats = async (req: Request, res: Response) => {
   try {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    const { startOfDay: today, endOfDay } = getTimezoneBoundaries();
 
-    const endOfDay = new Date(today);
-    endOfDay.setHours(23, 59, 59, 999);
+    const yesterdayDate = new Date(today);
+    yesterdayDate.setDate(yesterdayDate.getDate() - 1);
+    const { startOfDay: yesterday, endOfDay: endOfYesterday } = getTimezoneBoundaries(yesterdayDate);
 
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    
-    const endOfYesterday = new Date(yesterday);
-    endOfYesterday.setHours(23, 59, 59, 999);
-
-    const sevenDaysAgo = new Date(today);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+    const sevenDaysAgoDate = new Date(today);
+    sevenDaysAgoDate.setDate(sevenDaysAgoDate.getDate() - 6);
+    const { startOfDay: sevenDaysAgo } = getTimezoneBoundaries(sevenDaysAgoDate);
 
     // --- SUMMARY CARDS ---
     
