@@ -725,18 +725,40 @@ export class FrontdeskService {
   async createDoctorSchedule(doctorId: string, scheduleData: any, userId: string) {
     const { isRecurring, date, days, startTime, endTime, roomId, type, tokenLimit, interval, ignoreConflict, override } = scheduleData;
     
+    // Handle local date parsing safely
+    const localDateStr = date.includes('T') ? date.split('T')[0] : date;
+    const { startOfDay: validFrom, dayOfWeek: targetDayOfWeek } = getTimezoneBoundaries(localDateStr);
+
+    const untilDateStr = isRecurring 
+      ? (scheduleData.until ? scheduleData.until.split('T')[0] : '2099-12-31') 
+      : localDateStr;
+    const { endOfDay: validUntil } = getTimezoneBoundaries(untilDateStr);
+
     // Mapping 'Mon', 'Tue' to numbers
     const dayMap: Record<string, number> = { 'Sun':0, 'Mon':1, 'Tue':2, 'Wed':3, 'Thu':4, 'Fri':5, 'Sat':6 };
-    const numericDays = isRecurring && days ? days.map((d: string) => dayMap[d]) : [new Date(date).getDay()];
+    const numericDays = isRecurring && days && days.length > 0 
+      ? days.map((d: string) => dayMap[d]) 
+      : [targetDayOfWeek];
+
+    const dateOverlapFilter = {
+      validFrom: { lte: validUntil },
+      OR: [
+        { validUntil: null },
+        { validUntil: { gte: validFrom } }
+      ]
+    };
 
     const conflictingSessionIds: string[] = [];
     let conflictMessage: string | null = null;
 
     if (!ignoreConflict) {
-      // Conflict Check against database
+      // Conflict Check against database (date-aware overlap)
       const existingSessions = await prisma.doctorScheduleSession.findMany({
         where: {
-          schedule: { doctorId },
+          schedule: { 
+            doctorId,
+            ...dateOverlapFilter
+          },
           dayOfWeek: { in: numericDays },
           isActive: true
         },
@@ -757,6 +779,7 @@ export class FrontdeskService {
         const roomSessions = await prisma.doctorScheduleSession.findMany({
           where: {
             roomId: roomId,
+            schedule: dateOverlapFilter,
             dayOfWeek: { in: numericDays },
             isActive: true
           },
@@ -792,15 +815,6 @@ export class FrontdeskService {
         data: { isActive: false }
       });
     }
-
-    // Handle local date parsing safely
-    const localDateStr = date.includes('T') ? date.split('T')[0] : date;
-    const { startOfDay: validFrom } = getTimezoneBoundaries(localDateStr);
-
-    const untilDateStr = isRecurring 
-      ? (scheduleData.until || '2099-12-31').split('T')[0] 
-      : localDateStr;
-    const { endOfDay: validUntil } = getTimezoneBoundaries(untilDateStr);
 
     const schedule = await prisma.doctorSchedule.create({
       data: {
@@ -856,11 +870,25 @@ export class FrontdeskService {
     const conflictingSessionIds: string[] = [];
     let conflictMessage: string | null = null;
 
+    const targetValidFrom = existing.schedule.validFrom;
+    const targetValidUntil = existing.schedule.validUntil || new Date('2099-12-31T23:59:59.999Z');
+
+    const dateOverlapFilter = {
+      validFrom: { lte: targetValidUntil },
+      OR: [
+        { validUntil: null },
+        { validUntil: { gte: targetValidFrom } }
+      ]
+    };
+
     if (!ignoreConflict) {
-      // Check doctor overlap
+      // Check doctor overlap (date-aware)
       const existingSessions = await prisma.doctorScheduleSession.findMany({
         where: {
-          schedule: { doctorId: existing.schedule.doctorId },
+          schedule: { 
+            doctorId: existing.schedule.doctorId,
+            ...dateOverlapFilter
+          },
           dayOfWeek: existing.dayOfWeek,
           isActive: true,
           id: { not: sessionId }
@@ -877,11 +905,12 @@ export class FrontdeskService {
         }
       }
 
-      // Check room overlap
+      // Check room overlap (date-aware)
       if (roomId && !conflictMessage) {
         const roomSessions = await prisma.doctorScheduleSession.findMany({
           where: {
             roomId: roomId,
+            schedule: dateOverlapFilter,
             dayOfWeek: existing.dayOfWeek,
             isActive: true,
             id: { not: sessionId }
