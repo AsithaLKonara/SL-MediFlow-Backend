@@ -1031,7 +1031,7 @@ async function seedPatientsWorkflowAndFinance(
   // Pending Prescriptions for Pharmacy/POS workflow
   const demoPrescriptions = [
     {
-      visitId: 'DEMO-RX-VISIT-001',
+      visitId: createdAppts[0]?.id ?? 'DEMO-RX-VISIT-001',
       patient: patients[0],
       doctor: dr1,
       diagnosis: 'Acute Upper Respiratory Infection',
@@ -1044,7 +1044,7 @@ async function seedPatientsWorkflowAndFinance(
       ],
     },
     {
-      visitId: 'DEMO-RX-VISIT-002',
+      visitId: createdAppts[2]?.id ?? 'DEMO-RX-VISIT-002',
       patient: patients[2],
       doctor: dr2,
       diagnosis: 'Essential Hypertension & Dyslipidaemia Follow-up',
@@ -1057,7 +1057,7 @@ async function seedPatientsWorkflowAndFinance(
       ],
     },
     {
-      visitId: 'DEMO-RX-VISIT-003',
+      visitId: createdAppts[3]?.id ?? 'DEMO-RX-VISIT-003',
       patient: patients[3],
       doctor: dr1,
       diagnosis: 'Acute Gastritis',
@@ -1194,7 +1194,7 @@ async function seedPatientsWorkflowAndFinance(
 
       const inv = await prisma.invoice.create({
         data: {
-          visitId: `DEMO-FIN-VISIT-${i}`,
+          visitId: createdAppts[i % createdAppts.length]?.id ?? null,
           patientId: patient.id,
           subtotal: dailyTotals[i]!,
           totalAmount: dailyTotals[i]!,
